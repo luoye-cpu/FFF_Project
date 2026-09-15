@@ -1,7 +1,14 @@
 # 3FCompare 内核补丁索引（PATCHES）
 
-> 基线：上游 tag `upstream-baseline-2026.9.11`（f25c28f）。
-> 本地分支：`3fcompare/zoom-viewport-cover`，归档 tag `3fcompare-kernel-2026.9.11.1`。
+> 基线：上游 tag `upstream-baseline-2026.9.11`（f25c28f，**该 tag 名有滞后，实为上游 2026.9.12**）。
+> 本地分支：`3fcompare/zoom-viewport-cover`，当前归档 tag `3fcompare-kernel-2026.9.14.1`（`025198f`）。
+>
+> **升级记录**
+> | 日期 | 归档 tag | 上游 | 说明 |
+> |---|---|---|---|
+> | 2026-09-11 | `3fcompare-kernel-2026.9.11.1`（`6bc8d61`） | `f25c28f`（上游 9.12） | 首次 re-port |
+> | 2026-09-15 | `3fcompare-kernel-2026.9.14.1`（`025198f`） | `d8b2c03`（上游 9.14） | 仅 2 个 vbproj 变化，4 项扩展无需重移植；**尚未构建验证** |
+> | 2026-09-16 | `3fcompare-kernel-2026.9.14.2` | `d8b2c03`（上游 9.14） | 新增 A11 `preferredAdapterIndex`（PlayerApiVersion 14→15）。首次真正用 MSVC 构建本基线并通过实机验证，同时补齐了 9.14.1 缺失的构建验证 |
 > 本文档固化"哪些补丁必须在每次上游更新后重放"的清单，避免合并时靠记忆裁决。
 > 原则：**上游优先**——上游已有等价实现的一律不重放；仅托管 API 硬依赖且上游无等价的扩展保留。
 
@@ -15,6 +22,7 @@
 | GetRenderTargetInfo（K4 诊断） | `VideoRenderer.cpp/.h` 的 `RenderTargetInfo` 结构 + `lastDestX_/Y/Width/Height_` atomics；PlayerApi 导出 `FFF3FP_GetRenderTargetInfo` | `Fff3FpEngine` 轮询诊断 | `lastDest*` 由 `DrawCachedVideo` 成功路径记录——上游若重写该函数需重新锚定记录点 |
 | ReadPixelRegion（原 patch 0004，批量像素回读） | `VideoRenderer.cpp/.h`；PlayerApi 导出 `FFF3FP_ReadVideoPixelRegion` | `Fff3FpEngine.TryReadPixelRegion`（缩略图/取色） | 单次 staging 拷贝 + Map，替代逐像素 GPU 往返；依赖 `AcquireBackBufferTarget` / `DrawCachedVideo` / `swapOutputBits_`，上游渲染器重构时签名可能漂移 |
 | SetViewTransform 直写原子路径（原 0006 rev5） | `PlayerSession.cpp` `SetViewTransform`（绕过 Enqueue 命令队列直写渲染器原子量 + Redraw） | `Fff3FpEngine.SetViewTransform` ← UI 平移/缩放主路径 | 动机：命令队列在 Worker（解码）线程上执行，HD/HDR 播放时平移命令延迟数十 ms（"水平平移失效+卡顿"）。重放时保留上游的 disc 保护分支 |
+| **PreferredAdapterIndex（A11 多显卡指定解码）** | `FFF.Player.Api.h` 的 `FFF3FPConfiguration` **末尾** + `PlayerApiVersion` **递增** + `PlayerApi.cpp` 范围校验；`VideoRenderer.h/.cpp` 成员 `preferredAdapterIndex_` + `SetPreferredAdapterIndex()` + `EnsureDevice()` 指定索引优先分支；`PlayerSession.cpp` 构造期接线 | `Fff3FpEngine.ConfigVersion` **必须同步递增**（托管 `Fff3FpConfiguration` 同步加字段）；`GpuEnumeration` 必须走 **DXGI `EnumAdapters1`** | ⚠ **ABI 破坏性变更**：`FFF3FP_Create` 校验 `version != PlayerApiVersion` **严格相等**且 `size >= sizeof(config)` ⇒ 内核与托管**必须同批次发布**，错开一个版本就会让全部会话创建失败。字段**只能追加在结构体末尾**，不得移动/插入既有字段（否则静默错位）。失败时必须回落到内置 monitor 匹配策略 |
 
 ## 二、已被上游吸收（不重放，更新后需复核）
 
@@ -40,7 +48,8 @@
 
 ## 五、纯增量（随分支走，无重放成本）
 
-- `2fc46e9` 版本资源 `FFF.Native.rc`（FileVersion 主段 = PlayerApiVersion，当前 13；**升内核 API 时同步递增**，供托管 `NativeRuntime.ExtractEmbeddedDll` 版本比较）。
+- `2fc46e9` 版本资源 `FFF.Native.rc`（FileVersion 主段 = PlayerApiVersion，**当前 15**；**升内核 API 时同步递增**，供托管 `NativeRuntime.ExtractEmbeddedDll` 版本比较）。
+  ⚠ 本行此前长期写着"当前 13"，实际当时已是 14（托管 `Fff3FpEngine.ConfigVersion` 才是真源），现已更正。
 - `11b7f6d` `.gitignore` 忽略 `vcpkg_installed/`。
 
 ## 上游更新操作流程
