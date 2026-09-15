@@ -445,6 +445,9 @@ PlayerSession::PlayerSession(const FFF3FPConfiguration& configuration)
     LARGE_INTEGER frequency{}; QueryPerformanceFrequency(&frequency); qpcFrequency_ = frequency.QuadPart;
     if (configuration.audioEndpointIdUtf8 != nullptr) audioEndpointId_ = FromUtf8(configuration.audioEndpointIdUtf8);
     videoRenderer_.SetWindow(static_cast<HWND>(configuration.outputWindow));
+    // 3FCompare extension (A11): must be applied before the first EnsureDevice(),
+    // which happens lazily on the render path — hence here in the constructor.
+    videoRenderer_.SetPreferredAdapterIndex(configuration.preferredAdapterIndex);
     videoRenderer_.SetScalingQuality(configuration.videoScalingQuality);
     videoRenderer_.SetColorMode(configuration.colorMode, configuration.sdrPeakNits,
         configuration.hdrPeakNits, configuration.sdrPaperWhiteNits,

@@ -115,6 +115,13 @@ public:
     ~PlayerVideoRenderer();
 
     FFFResult SetWindow(HWND window) noexcept;
+    // 3FCompare extension (A11): choose which DXGI adapter creates the D3D11 device.
+    // index = -1 (default) keeps the built-in policy: the adapter driving the monitor
+    // that contains the output window. index >= 0 is used as the argument of
+    // IDXGIFactory1::EnumAdapters1. Takes effect on the next device creation
+    // (EnsureDevice), including device-loss recovery.
+    // Out-of-range / non-enumerable indices silently fall back to the built-in policy.
+    FFFResult SetPreferredAdapterIndex(std::int32_t index) noexcept;
     void SetDiscAspect(double aspect) noexcept { discAspect_.store(static_cast<float>(aspect)); }
     void SetInteractiveMove(bool enabled) noexcept;
     FFFResult SetScalingQuality(FFF3FPVideoScalingQuality quality) noexcept;
@@ -303,6 +310,10 @@ private:
     void SetError(std::string message) noexcept;
 
     HWND window_;
+    // 3FCompare A11: -1 = auto (adapter driving the window's monitor). See
+    // SetPreferredAdapterIndex. Deliberately a plain value: the device is created
+    // lazily and re-created on device loss, so the preference must survive both.
+    std::int32_t preferredAdapterIndex_ = -1;
     ID3D11Device* device_;
     ID3D11DeviceContext* context_;
     IDXGISwapChain4* swapChain_;

@@ -105,6 +105,13 @@ struct FFF3FPConfiguration {
     void* eventCallbackContext;
     FFF3FPVideoScalingQuality videoScalingQuality;
     std::uint32_t forceHdrOutput;
+    // 3FCompare extension (A11): preferred DXGI adapter index for the D3D11 device.
+    // Use -1 (or any negative value) to keep the built-in policy: pick the adapter
+    // that drives the monitor containing the output window. The index matches
+    // IDXGIFactory1::EnumAdapters1 — the enumeration the managed side must use so
+    // both sides agree on "which adapter is #1".
+    // Out-of-range or failed enumeration falls back to the built-in policy.
+    std::int32_t preferredAdapterIndex;
 };
 
 struct FFF3FPSnapshot {

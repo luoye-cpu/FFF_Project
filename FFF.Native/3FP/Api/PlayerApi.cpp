@@ -7,7 +7,10 @@
 #include <atomic>
 
 namespace {
-constexpr std::uint32_t PlayerApiVersion = 14;
+// Bumped 14 -> 15 for the 3FCompare A11 extension (preferredAdapterIndex in
+// FFF3FPConfiguration). FFF3FP_Create rejects a mismatched version outright, so
+// the managed Fff3FpEngine.ConfigVersion MUST be bumped in lockstep.
+constexpr std::uint32_t PlayerApiVersion = 15;
 
 // 3FCompare extension (F-LOG): process-wide native log sink.
 std::atomic<FFF3FPLogCallback> g_logSink{nullptr};
@@ -51,6 +54,9 @@ FFFResult FFF3FP_Create(const FFF3FPConfiguration* configuration, FFF3FPHandle* 
         configuration->decodeMode > FFF3FPDecodeMode::D3D11 || configuration->colorMode > FFF3FPColorMode::MapToHdr ||
         configuration->videoScalingQuality > FFF3FPVideoScalingQuality::HighQuality ||
         configuration->forceHdrOutput > 1 ||
+        // 3FCompare A11: -1 = auto (adapter driving the window's monitor); 0..15 = DXGI index.
+        // Mirrors AppSettings.Normalize() clamping on the managed side.
+        configuration->preferredAdapterIndex < -1 || configuration->preferredAdapterIndex > 15 ||
         !std::isfinite(configuration->sdrPeakNits) || configuration->sdrPeakNits <= 0 ||
         !std::isfinite(configuration->hdrPeakNits) || configuration->hdrPeakNits < 0 ||
         configuration->hdrPeakNits > 10000 || !std::isfinite(configuration->sdrPaperWhiteNits) ||

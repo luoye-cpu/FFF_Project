@@ -1843,6 +1843,19 @@ FFFResult PlayerVideoRenderer::SetWindow(const HWND window) noexcept {
     return FFFResult::Success;
 }
 
+FFFResult PlayerVideoRenderer::SetPreferredAdapterIndex(const std::int32_t index) noexcept {
+    if (index < -1 || index > 15) return FFFResult::InvalidArgument;
+    std::lock_guard deviceLock(deviceMutex_);
+    preferredAdapterIndex_ = index;
+    // The preference is only consulted by EnsureDevice(), i.e. at device-creation
+    // time. We deliberately do not tear down an existing device here: that would
+    // force a swap-chain rebuild from an arbitrary call site, and
+    // ReleaseDeviceObjects() expects its caller to already hold deviceMutex_.
+    // In practice every caller sets this during session construction, when
+    // device_ is still null, so it is picked up by the first EnsureDevice().
+    return FFFResult::Success;
+}
+
 void PlayerVideoRenderer::SetInteractiveMove(const bool enabled) noexcept {
     interactiveMove_.store(enabled, std::memory_order_release);
 }
@@ -1936,7 +1949,18 @@ FFFResult PlayerVideoRenderer::EnsureDevice() noexcept {
         D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0 };
     D3D_FEATURE_LEVEL selected{};
     ComPtr<IDXGIAdapter1> selectedAdapter;
-    if (window_ != nullptr && IsWindow(window_)) {
+    // 3FCompare extension (A11): an explicitly requested adapter outranks the
+    // monitor match. Any enumeration failure (bad index, no factory) leaves
+    // selectedAdapter null so the built-in policy below still runs — the caller
+    // never sees a hard failure just because a GPU preference could not be honoured.
+    if (preferredAdapterIndex_ >= 0) {
+        ComPtr<IDXGIFactory6> preferredFactory;
+        if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&preferredFactory)))) {
+            preferredFactory->EnumAdapters1(
+                static_cast<UINT>(preferredAdapterIndex_), &selectedAdapter);
+        }
+    }
+    if (!selectedAdapter && window_ != nullptr && IsWindow(window_)) {
         const auto monitor = MonitorFromWindow(window_, MONITOR_DEFAULTTONEAREST);
         ComPtr<IDXGIFactory6> factory;
         if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) {
@@ -1960,6 +1984,31 @@ FFFResult PlayerVideoRenderer::EnsureDevice() noexcept {
         D3D11_CREATE_DEVICE_BGRA_SUPPORT,
         levels, ARRAYSIZE(levels), D3D11_SDK_VERSION, &device_, &selected, &context_);
     if (FAILED(result)) { SetError("Could not create the D3D11 playback device."); return FFFResult::DeviceFailure; }
+
+    // 3FCompare (A11) diagnostic: report which adapter actually backs the device.
+    // Without this there is no way to tell from the outside whether a requested
+    // adapter index was honoured, silently ignored, or fell back to the default
+    // policy — the three cases are indistinguishable in behaviour on a machine
+    // where the default happens to be the same GPU.
+    {
+        ComPtr<IDXGIDevice> dxgiDevice;
+        ComPtr<IDXGIAdapter> adapter;
+        if (SUCCEEDED(device_->QueryInterface(IID_PPV_ARGS(&dxgiDevice))) &&
+            SUCCEEDED(dxgiDevice->GetAdapter(&adapter))) {
+            DXGI_ADAPTER_DESC desc{};
+            if (SUCCEEDED(adapter->GetDesc(&desc))) {
+                std::string line = "A11: device adapter requested=" +
+                    std::to_string(preferredAdapterIndex_) +
+                    " vendor=" + std::to_string(desc.VendorId) +
+                    " device=" + std::to_string(desc.DeviceId) +
+                    " luid=" + std::to_string(desc.AdapterLuid.HighPart) + ":" +
+                    std::to_string(desc.AdapterLuid.LowPart);
+                extern void FFF3FP_KernelLogImpl(const char*) noexcept;
+                FFF3FP_KernelLogImpl(line.c_str());
+            }
+        }
+    }
+
     ComPtr<ID3D11Multithread> multithread;
     if (SUCCEEDED(context_->QueryInterface(IID_PPV_ARGS(&multithread)))) multithread->SetMultithreadProtected(TRUE);
     return FFFResult::Success;
