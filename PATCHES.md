@@ -31,8 +31,8 @@
 
 | 补丁 | 上游等价实现 | 复核点 |
 |---|---|---|
-| 6e7469f DWM 修复（ResizeBuffers 后 `Present(0,0)` 解除 DWM 停滞） | 上游 `VideoRenderer.cpp` EnsureSwapChain 失败恢复路径自带 `swapChain_->Present(0, 0)`（2026.9 master） | 上游若重构 swapchain 恢复逻辑，确认该路径仍在 |
-| 8204c02 音频缓冲 250ms 硬编码 | 上游 WASAPI 重构：`bufferDuration = clamp(sharedDefaultPeriod*3, 50ms, 200ms)` 自适应 | 若高码率多声道仍欠载，评估调 clamp 上限而非恢复硬编码 |
+| 6e7469f DWM 修复（ResizeBuffers 后 `Present(0,0)` 解除 DWM 停滞） | ✅ **已确认吸收**：`VideoRenderer.cpp` 的 EnsureSwapChain 失败恢复路径自带 `swapChain_->Present(0, 0)`（2026-09-17 核对上游 `ea3ce05`，该文件确有 `Present(0, 0)`） | 上游若重构 swapchain 恢复逻辑，确认该路径仍在 |
+| 8204c02 音频缓冲 | ⚠ **只吸收了一半，别搞混这两处**：<br>· `WasapiRenderer.cpp` 的 WASAPI **缓冲区大小** —— 上游已改为 `bufferDuration = clamp(sharedDefaultPeriod*3, 50ms, 200ms)` 自适应 ✅<br>· `PlayerSession.cpp` 的 `TargetAudioBuffer100ns` —— 这是**音频包投喂阈值**（`audioBuffered < TargetAudioBuffer100ns` 才继续喂），上游 **仍是 1'200'000（120ms）固定值**，我方改为 250ms | 250ms 是"延迟换抗欠载"：对视频对比工具合适（延迟不敏感、抗欠载优先），**但对通用播放器会增加延迟 ⇒ 不推上游**。若高码率多声道仍欠载，优先评估调上游 clamp 上限 |
 
 ## 三、已移除（有意不保留）
 
@@ -41,6 +41,14 @@
 | P3 原生变速 SetSpeed（`7e85c99`：时钟斜率 + Wasapi `speed_` 缩放 + `SpeedChanged` 事件 + 渲染器 speedBits shim） | 内核完整但托管侧 0 绑定（死代码）；与 UI 伪变速（每秒 Seek）语义冲突；每次上游更新白付重移植税。2026-09-13 从 PlayerApi 导出、API 头声明/枚举、PlayerSession、WasapiRenderer、VideoRenderer 全链路移除 | 托管侧正式接线时（导出 `FFF3FP_SetSpeed`、删除 UI 伪变速、加声画漂移测试 ≤100ms），从历史提交 `7e85c99` 整体重移植 |
 
 ## 四、保留但非重放义务（逐次评估）
+
+> ⚠ **2026-09-17 核对结论：本类三项均已不在当前代码中。**
+> 经与上游 `ea3ce05` 逐项比对（`FF_THREAD_FRAME` / `SetMaximumFrameLatency` /
+> `interactiveMove_` try_lock 在两边都存在，`SetMaximumFrameLatency` 两边同为 **1**），
+> 确认：FLAC 多线程、P2 无锁快路径、HDR 元数据去重 + `SetMaximumFrameLatency(1→2)`
+> **都已随上游 2026.9 渲染器重构被吸收，或我方重移植时已放弃**。
+> 以下原文保留作历史留档，**不要再按它去"重放"**——重放会与上游现有实现重复甚至冲突。
+> 当前真正存在的本地补丁只有：类别一 5 项 + 类别五 2 项 + `TargetAudioBuffer100ns` 250ms。
 
 | 项 | 现状 | 评估要点 |
 |---|---|---|
@@ -54,6 +62,33 @@
 - `2fc46e9` 版本资源 `FFF.Native.rc`（FileVersion 主段 = PlayerApiVersion，**当前 15**；**升内核 API 时同步递增**，供托管 `NativeRuntime.ExtractEmbeddedDll` 版本比较）。
   ⚠ 本行此前长期写着"当前 13"，实际当时已是 14（托管 `Fff3FpEngine.ConfigVersion` 才是真源），现已更正。
 - `11b7f6d` `.gitignore` 忽略 `vcpkg_installed/`。
+
+## 六、本地补丁与 issue #7（多路随机崩溃）的关系 —— **无关**（2026-09-17 实测）
+
+用户提出质疑：本地有大量补丁，崩溃是否由它们引入？**实测结论：不是。**
+
+**唯一的嫌疑项与证伪过程。** 本地补丁中，唯一会触及"交换链改写"的是
+`SetViewTransform` 直写路径（类别一 0006 rev5）——它绕过 `Enqueue` 后，
+`Redraw()` → `EnsureSwapChain()` 可从任意调用线程发起，而我们已证实
+"Present 撞上交换链改写"正是崩溃触发条件（把它串行化后 8 路崩溃率 56% → 12.5%）。
+
+于是做了回退实验（分支 `3fc/exp-revert-svt`，提交 `2b90a87`，产物 `kernel_revert_svt.dll`）：
+把 `PlayerSession::SetViewTransform` 改回上游 `Enqueue` 版并编译——
+**8 路崩溃 5/8，同批次基线 4/8，没有下降 ⇒ 假设证伪。**
+
+（事后看也合理：zoom 只改变绘制矩形、不改变 swapchain 尺寸，`EnsureSwapChain`
+通常会 early-return，所以这条路径很少真的触发改写。）
+
+**其余补丁逐一排除：**
+- A11 `preferredAdapterIndex` —— 只在 `EnsureDevice()` 建设备时生效，运行时不参与；
+- `ReadPixelRegion` / `GetRenderTargetInfo` —— 持锁与上游既有 `ReadPixel` 一致，
+  且 `--multitest` 根本不调用它们；
+- `TargetAudioBuffer100ns` 250ms —— 只影响音频包投喂，不碰 GPU/DXGI；
+- `SetPresentConfig` / `SetPacingConfig` —— 后者是 no-op；
+- 类别四三项 —— 已不在当前代码中（见该节）。
+
+⇒ **不要再往"本地补丁导致崩溃"这个方向排查。** 根因是内核里跨渲染器并发 Present
+这一**上游既有设计**问题，与我们的扩展无关。
 
 ## 上游更新操作流程
 
