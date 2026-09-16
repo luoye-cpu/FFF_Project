@@ -53,6 +53,8 @@ public:
     FFFResult SetExternalAudioOffset(std::int64_t offset100ns) noexcept;
     FFFResult SetColorMode(FFF3FPColorMode mode, float sdrPeakNits,
         float hdrPeakNits, float paperWhiteNits, bool forceHdrOutput) noexcept;
+    FFFResult SetPresentConfig(bool enableTearing) noexcept;
+    FFFResult SetPacingConfig(bool enablePacing) noexcept;
     FFFResult SetOutputWindow(void* outputWindow) noexcept;
     FFFResult SetInteractiveMove(bool enabled) noexcept;
     FFFResult SetViewTransform(float zoom, float panX, float panY) noexcept;
@@ -63,10 +65,17 @@ public:
     FFFResult SetTimedTextLayer(const FFF3FPTimedTextLayer& layer) noexcept;
     FFFResult GetSnapshot(FFF3FPSnapshot& snapshot) const noexcept;
     FFFResult ReadVideoPixel(FFF3FPVideoPixelProbe& probe) noexcept;
+    // 3FCompare patch (0004)
+    FFFResult ReadVideoPixelRegion(std::uint32_t x, std::uint32_t y,
+        std::uint32_t width, std::uint32_t height, float* dst,
+        std::uint32_t dstFloatCount, std::uint32_t* outputBitDepth) noexcept;
     FFFResult GetAudioPeakLevels(FFF3FPAudioPeakLevels& levels) const noexcept;
     FFFResult GetTimedTextStatus(FFF3FPTimedTextStatus& status) noexcept;
     FFFResult GetDanmakuStatus(FFF3FPTimedTextStatus& status) noexcept;
     FFFResult GetLyricsStatus(FFF3FPTimedTextStatus& status) noexcept;
+    // 3FCompare K1/K5
+    FFFResult GetRenderTargetInfo(FFF3FPRenderTargetInfo& info) noexcept;
+    FFFResult Redraw() noexcept;
     std::string MediaInfo() const;
     std::string LastError() const;
 

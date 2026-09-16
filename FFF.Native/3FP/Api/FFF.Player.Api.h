@@ -105,6 +105,13 @@ struct FFF3FPConfiguration {
     void* eventCallbackContext;
     FFF3FPVideoScalingQuality videoScalingQuality;
     std::uint32_t forceHdrOutput;
+    // 3FCompare extension (A11): preferred DXGI adapter index for the D3D11 device.
+    // Use -1 (or any negative value) to keep the built-in policy: pick the adapter
+    // that drives the monitor containing the output window. The index matches
+    // IDXGIFactory1::EnumAdapters1 — the enumeration the managed side must use so
+    // both sides agree on "which adapter is #1".
+    // Out-of-range or failed enumeration falls back to the built-in policy.
+    std::int32_t preferredAdapterIndex;
 };
 
 struct FFF3FPSnapshot {
@@ -196,6 +203,12 @@ struct FFF3FPAudioPeakLevels {
 using FFF3FPHandle = void*;
 using FFF3FPBitmapSubtitleHandle = void*;
 using FFF3FPAssSubtitleHandle = void*;
+
+// 3FCompare extension (F-LOG): process-wide native log sink. The kernel calls
+// this with UTF-8 log lines from any of its threads (decode/present/recovery);
+// the managed side routes them into the on-disk logs/ channel. Install once at
+// startup before creating sessions; passing nullptr detaches the sink.
+using FFF3FPLogCallback = void(__cdecl*)(void* context, const char* utf8Line) noexcept;
 
 enum class FFF3FPBitmapSubtitleFlags : std::uint32_t {
     None = 0,
@@ -426,6 +439,8 @@ struct FFF3FPVideoPixelProbe {
 #endif
 
 FFF3FP_API std::uint32_t FFF3FP_GetApiVersion() noexcept;
+// 3FCompare extension (F-LOG): install the process-wide native log sink.
+FFF3FP_API void FFF3FP_SetLogCallback(FFF3FPLogCallback callback, void* context) noexcept;
 FFF3FP_API FFFResult FFF3FP_Create(const FFF3FPConfiguration* configuration,
     FFF3FPHandle* player) noexcept;
 FFF3FP_API FFFResult FFF3FP_Open(FFF3FPHandle player, const char* localPathUtf8) noexcept;
@@ -457,6 +472,23 @@ FFF3FP_API FFFResult FFF3FP_SetExternalAudioOffset(FFF3FPHandle player,
 FFF3FP_API FFFResult FFF3FP_SetColorMode(FFF3FPHandle player, FFF3FPColorMode mode,
     float sdrPeakNits, float hdrPeakNits, float sdrPaperWhiteNits,
     std::uint32_t forceHdrOutput) noexcept;
+// Present pacing (VRR / G-SYNC / FreeSync low-latency path, 3FCompare extension):
+// enableTearing = 1 selects Present(0, DXGI_PRESENT_ALLOW_TEARING) so a VRR display
+// can scan out on its own schedule; 0 keeps the default vsync-locked Present(1, 0).
+// Swap chains are created with the ALLOW_TEARING capability flag whenever the OS
+// reports support, so toggling does not require chain recreation. If tearing is
+// requested but unsupported by the display chain, the request is remembered while
+// the renderer keeps the vsync path (returns NotSupported).
+FFF3FP_API FFFResult FFF3FP_SetPresentConfig(FFF3FPHandle player,
+    std::uint32_t enableTearing) noexcept;
+// Media-rate presentation pacing for VRR (3FCompare extension, A9):
+// enablePacing = 1 suppresses the timed-text thread's periodic keepalive
+// presents that would otherwise add extra flips beyond the source video frame
+// rate on VRR displays. Overlay-only updates still present at their own rate.
+// Requires tearing to be active (SetPresentConfig(1)) for full effect on VRR
+// displays; on vsync-locked displays the change is harmless (no extra flips).
+FFF3FP_API FFFResult FFF3FP_SetPacingConfig(FFF3FPHandle player,
+    std::uint32_t enablePacing) noexcept;
 FFF3FP_API FFFResult FFF3FP_SetOutputWindow(FFF3FPHandle player, void* outputWindow) noexcept;
 FFF3FP_API FFFResult FFF3FP_SetInteractiveMove(FFF3FPHandle player, std::uint32_t enabled) noexcept;
 // View transform for frame inspection: zoom scales the fitted video box
@@ -480,6 +512,15 @@ FFF3FP_API FFFResult FFF3FP_SetTimedTextLayer(FFF3FPHandle player,
 FFF3FP_API FFFResult FFF3FP_GetSnapshot(FFF3FPHandle player, FFF3FPSnapshot* snapshot) noexcept;
 FFF3FP_API FFFResult FFF3FP_ReadVideoPixel(FFF3FPHandle player,
     FFF3FPVideoPixelProbe* probe) noexcept;
+// 3FCompare patch (0004): batch pixel readback. Samples a rectangular region
+// of the presented frame in ONE staging copy + Map instead of one GPU round
+// trip per pixel. dst receives w*h RGBA32F samples (row-major, premultiplied
+// order R,G,B,A), normalized exactly like FFF3FPVideoPixelProbe fields.
+// Returns the actual output bit depth via outputBitDepth.
+FFF3FP_API FFFResult FFF3FP_ReadVideoPixelRegion(FFF3FPHandle player,
+    std::uint32_t x, std::uint32_t y, std::uint32_t width, std::uint32_t height,
+    float* dst, std::uint32_t dstFloatCount,
+    std::uint32_t* outputBitDepth) noexcept;
 FFF3FP_API FFFResult FFF3FP_GetAudioPeakLevels(FFF3FPHandle player,
     FFF3FPAudioPeakLevels* levels) noexcept;
 FFF3FP_API FFFResult FFF3FP_GetTimedTextStatus(FFF3FPHandle player,
@@ -505,6 +546,28 @@ FFF3FP_API FFFResult FFF3FP_GetMediaInfo(FFF3FPHandle player, char* outputUtf8,
     std::uint32_t outputSize, std::uint32_t* requiredSize) noexcept;
 FFF3FP_API FFFResult FFF3FP_GetLastError(FFF3FPHandle player, char* outputUtf8,
     std::uint32_t outputSize, std::uint32_t* requiredSize) noexcept;
+// 3FCompare K1/K5: render-target diagnostics + present hint. RenderTargetInfo
+// reports the current swapchain/client/destination sizes (for App-side overlay
+// positioning and pixel-probe coordinate mapping). Redraw() re-presents the
+// last cached frame on the presenter thread — the App calls it after a child
+// HWND resize so flips continue issuing (ResizeBuffers stays on the presenter).
+struct FFF3FPRenderTargetInfo {
+    std::uint32_t size;
+    std::uint32_t version; // == 1
+    std::uint32_t swapWidth;
+    std::uint32_t swapHeight;
+    std::uint32_t clientWidth;
+    std::uint32_t clientHeight;
+    std::uint32_t destX;
+    std::uint32_t destY;
+    std::uint32_t destWidth;
+    std::uint32_t destHeight;
+    std::uint32_t outputBitDepth;
+    std::uint32_t hdr;
+};
+FFF3FP_API FFFResult FFF3FP_GetRenderTargetInfo(FFF3FPHandle player,
+    FFF3FPRenderTargetInfo* info) noexcept;
+FFF3FP_API FFFResult FFF3FP_Redraw(FFF3FPHandle player) noexcept;
 FFF3FP_API void FFF3FP_Destroy(FFF3FPHandle player) noexcept;
 
 FFF3FP_API FFFResult FFF3FP_OpenBitmapSubtitle(const char* localPathUtf8,

@@ -35,7 +35,9 @@ constexpr std::int64_t TargetVideoLookAhead100ns = 1'500'000;
 // Buffered100ns includes both application PCM and samples already submitted to
 // WASAPI.  Keep the complete audible queue short so seek, stream/volume changes
 // and the information overlay reflect a low-latency local playback pipeline.
-constexpr std::int64_t TargetAudioBuffer100ns = 1'200'000;
+// 3FCompare: increase from 120ms to 250ms for high-bitrate multi-channel audio
+// (FLAC 6ch + AV1 soft decode) to prevent audio underruns during decode spikes.
+constexpr std::int64_t TargetAudioBuffer100ns = 2'500'000;
 constexpr std::size_t MaximumIndexedVideoFrames = 32'768;
 constexpr std::size_t MaximumPendingVideoPackets = 64;
 constexpr std::size_t MaximumPendingVideoPacketBytes = 16 * 1024 * 1024;
@@ -443,6 +445,9 @@ PlayerSession::PlayerSession(const FFF3FPConfiguration& configuration)
     LARGE_INTEGER frequency{}; QueryPerformanceFrequency(&frequency); qpcFrequency_ = frequency.QuadPart;
     if (configuration.audioEndpointIdUtf8 != nullptr) audioEndpointId_ = FromUtf8(configuration.audioEndpointIdUtf8);
     videoRenderer_.SetWindow(static_cast<HWND>(configuration.outputWindow));
+    // 3FCompare extension (A11): must be applied before the first EnsureDevice(),
+    // which happens lazily on the render path — hence here in the constructor.
+    videoRenderer_.SetPreferredAdapterIndex(configuration.preferredAdapterIndex);
     videoRenderer_.SetScalingQuality(configuration.videoScalingQuality);
     videoRenderer_.SetColorMode(configuration.colorMode, configuration.sdrPeakNits,
         configuration.hdrPeakNits, configuration.sdrPaperWhiteNits,
@@ -1068,6 +1073,18 @@ FFFResult PlayerSession::ClearExternalAudio() noexcept {
     return FFFResult::Success;
 }
 FFFResult PlayerSession::SetExternalAudioOffset(const std::int64_t offset) noexcept { const auto state = state_.load(); if (state != FFF3FPState::Ready && state != FFF3FPState::Playing && state != FFF3FPState::Paused && state != FFF3FPState::Ended) return FFFResult::InvalidState; Enqueue([this, offset] { externalAudioOffset100ns_ = offset; snapshot_.externalAudioOffset100ns = offset; if (externalFormat_) DoSeek(snapshot_.position100ns); else PublishSnapshot(); }); return FFFResult::Success; }
+FFFResult PlayerSession::SetPresentConfig(const bool enableTearing) noexcept {
+    // Pacing preference: safe in any state; the renderer applies it on the next
+    // present and remembers the request across device/chain re-creation.
+    Enqueue([this, enableTearing] { videoRenderer_.SetPresentConfig(enableTearing); });
+    return FFFResult::Success;
+}
+FFFResult PlayerSession::SetPacingConfig(const bool enablePacing) noexcept {
+    // Media-rate presentation pacing (A9): applied by the TimedTextThread on the
+    // next loop iteration; safe in any state, no chain work required.
+    Enqueue([this, enablePacing] { videoRenderer_.SetPacingConfig(enablePacing); });
+    return FFFResult::Success;
+}
 FFFResult PlayerSession::SetColorMode(const FFF3FPColorMode mode, const float sdr, const float hdr,
     const float paper, const bool forceHdrOutput) noexcept {
     if (mode > FFF3FPColorMode::MapToHdr || !std::isfinite(sdr) || sdr <= 0 ||
@@ -1154,15 +1171,22 @@ FFFResult PlayerSession::SetViewTransform(const float zoom, const float panX,
     const float panY) noexcept {
     if (!std::isfinite(zoom) || zoom <= 0.0f || !std::isfinite(panX) || !std::isfinite(panY))
         return FFFResult::InvalidArgument;
-    Enqueue([this, zoom, panX, panY] {
-        if (disc_) return;
-        const auto result = videoRenderer_.SetViewTransform(zoom, panX, panY);
-        if (result != FFFResult::Success) return;
-        const auto redrawResult = videoRenderer_.Redraw();
-        if (redrawResult != FFFResult::Success &&
-            redrawResult != FFFResult::InvalidState &&
-            videoRenderer_.RequestRecoveryIfDeviceLost()) return;
-    });
+    // 3FCompare patch (0006 rev5): bypass the playback command queue. The old
+    // Enqueue path executed the transform on the Worker (decode) thread —
+    // during HD/HDR playback that thread is busy decoding for tens of ms, so
+    // the queued pan commands arrived late or never before the next frame
+    // upload wiped them (the "horizontal pan dead + stutter" bug).
+    // ViewTransform is three relaxed atomics inside the renderer; writing them
+    // from any thread is safe. Redraw only wakes the presenter via its fast
+    // path, which also does not contend with decode.
+    // Upstream 2026.9: guard disc playback (disc renderer has its own view path).
+    if (disc_) return FFFResult::Success;
+    const auto result = videoRenderer_.SetViewTransform(zoom, panX, panY);
+    if (result != FFFResult::Success) return result;
+    const auto redrawResult = videoRenderer_.Redraw();
+    if (redrawResult != FFFResult::Success &&
+        redrawResult != FFFResult::InvalidState &&
+        videoRenderer_.RequestRecoveryIfDeviceLost()) return redrawResult;
     return FFFResult::Success;
 }
 FFFResult PlayerSession::Set360View(const bool enabled, const float yaw,
@@ -1649,6 +1673,33 @@ FFFResult PlayerSession::GetLyricsStatus(FFF3FPTimedTextStatus& status) noexcept
     return videoRenderer_.GetTimedTextStatus(status, TimedTextLayerSlot::Lyrics);
 }
 
+// 3FCompare K1/K5: forward to the renderer (RTInfo under deviceMutex_, Redraw wake fast path).
+FFFResult PlayerSession::GetRenderTargetInfo(FFF3FPRenderTargetInfo& info) noexcept {
+    info.size = sizeof(info);
+    info.version = 1;
+    PlayerVideoRenderer::RenderTargetInfo rtInfo{};
+    const auto result = videoRenderer_.GetRenderTargetInfo(rtInfo);
+    if (result != FFFResult::Success) return result;
+    info.swapWidth = rtInfo.swapWidth;
+    info.swapHeight = rtInfo.swapHeight;
+    info.clientWidth = rtInfo.clientWidth;
+    info.clientHeight = rtInfo.clientHeight;
+    info.destX = rtInfo.destX;
+    info.destY = rtInfo.destY;
+    info.destWidth = rtInfo.destWidth;
+    info.destHeight = rtInfo.destHeight;
+    info.outputBitDepth = rtInfo.outputBitDepth;
+    info.hdr = rtInfo.hdr ? 1 : 0;
+    return FFFResult::Success;
+}
+
+FFFResult PlayerSession::Redraw() noexcept {
+    const auto result = videoRenderer_.Redraw();
+    if (result == FFFResult::DeviceFailure)
+        videoRenderer_.RequestRecoveryIfDeviceLost();
+    return result;
+}
+
 FFFResult PlayerSession::GetSnapshot(FFF3FPSnapshot& output) const noexcept {
     if (output.size < sizeof(FFF3FPSnapshot) || output.version != 8) return FFFResult::InvalidArgument;
     { std::lock_guard lock(snapshotMutex_); output = publishedSnapshot_; }
@@ -1697,6 +1748,15 @@ FFFResult PlayerSession::GetSnapshot(FFF3FPSnapshot& output) const noexcept {
 
 FFFResult PlayerSession::ReadVideoPixel(FFF3FPVideoPixelProbe& probe) noexcept {
     const auto result = videoRenderer_.ReadPixel(probe);
+    if (result == FFFResult::DeviceFailure)
+        videoRenderer_.RequestRecoveryIfDeviceLost();
+    return result;
+}
+FFFResult PlayerSession::ReadVideoPixelRegion(const std::uint32_t x, const std::uint32_t y,
+    const std::uint32_t width, const std::uint32_t height, float* dst,
+    const std::uint32_t dstFloatCount, std::uint32_t* outputBitDepth) noexcept {
+    const auto result = videoRenderer_.ReadPixelRegion(
+        x, y, width, height, dst, dstFloatCount, outputBitDepth);
     if (result == FFFResult::DeviceFailure)
         videoRenderer_.RequestRecoveryIfDeviceLost();
     return result;
@@ -1824,13 +1884,28 @@ FFFResult PlayerSession::OpenDecoder(AVFormatContext* owner, const std::int32_t 
     }
     auto result = avcodec_parameters_to_context(context, stream->codecpar);
     context->pkt_timebase = stream->time_base;
+    // Note: the bundled FFmpeg (libavcodec 63) exposes AVCodecContext.ch_layout
+    // but no request-channel-layout field (request_channel_layout/request_ch_layout
+    // were removed upstream).  Downmix of multi-channel audio is handled in
+    // PlayerWasapiRenderer::EnsureResampler via swr_alloc_set_opts2 with an
+    // endpoint-stereo output layout; see the audio renderer for that path.
     if (result >= 0 && video && !hardwareRequested) {
         const auto hardwareThreads = std::max(1u, std::thread::hardware_concurrency());
         context->thread_count = static_cast<int>(std::min(
             hardwareThreads, MaximumSoftwareDecoderThreads));
         context->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
     }
-    if (disc_ && disc_->Menu() && video &&
+    // 3FCompare patch (0008): multi-threaded audio decoding (FLAC supports
+    // frame-level parallelism). Reduces CPU contention between AV1 video and
+    // FLAC audio decode.
+    if (result >= 0 && !video && !hardwareRequested) {
+        const auto hardwareThreads = std::max(1u, std::thread::hardware_concurrency());
+        context->thread_count = static_cast<int>(std::min(
+            hardwareThreads, MaximumSoftwareDecoderThreads));
+        context->thread_type = FF_THREAD_FRAME;
+    }
+    // Upstream 2026.9: disc menu MPEG2 video needs low-delay single-thread slice decode.
+    if (result >= 0 && disc_ && disc_->Menu() && video &&
         stream->codecpar->codec_id == AV_CODEC_ID_MPEG2VIDEO) {
         context->flags |= AV_CODEC_FLAG_LOW_DELAY;
         context->thread_count = 1;
@@ -3327,9 +3402,13 @@ void PlayerSession::SetState(const FFF3FPState state, const char* operation) noe
 
 void PlayerSession::Fail(const FFFResult result, std::string message, const char* operation) noexcept {
     try {
-        SuspendAudioRenderer(true); snapshot_.state = FFF3FPState::Failed; state_.store(FFF3FPState::Failed); PublishSnapshot();
-        ReportError(result, std::move(message), operation); }
-    catch (...) {}
+        // 3FCompare (F-LOG): kernel failure sink
+        extern void FFF3FP_KernelLogImpl(const char*) noexcept;
+        FFF3FP_KernelLogImpl(("FAIL: " + std::string(operation ? operation : "") + ": " + message).c_str());
+    } catch (...) {}
+    try { SuspendAudioRenderer(true); snapshot_.state = FFF3FPState::Failed; state_.store(FFF3FPState::Failed); PublishSnapshot();
+        ReportError(result, std::move(message), operation);
+    } catch (...) {}
 }
 
 void PlayerSession::ReportError(const FFFResult result, std::string message, const char* operation) noexcept {
