@@ -1,14 +1,17 @@
 # 3FCompare 内核补丁索引（PATCHES）
 
-> 基线：上游 tag `upstream-baseline-2026.9.11`（f25c28f，**该 tag 名有滞后，实为上游 2026.9.12**）。
-> 本地分支：`3fcompare/zoom-viewport-cover`，当前归档 tag `3fcompare-kernel-2026.9.14.1`（`025198f`）。
+> 基线：上游 master `ea3ce05`（2026-09-17，含已合并的 PR #8 = issue #7 修复）。
+> 本地分支：`3fcompare/integrate-issue7`，当前归档 tag `3fcompare-kernel-2026.9.17.1`（`b6b96a6`）。
+> （历史分支 `3fcompare/zoom-viewport-cover` 保留，停在 `0fe33c4`。）
 >
 > **升级记录**
 > | 日期 | 归档 tag | 上游 | 说明 |
 > |---|---|---|---|
 > | 2026-09-11 | `3fcompare-kernel-2026.9.11.1`（`6bc8d61`） | `f25c28f`（上游 9.12） | 首次 re-port |
 > | 2026-09-15 | `3fcompare-kernel-2026.9.14.1`（`025198f`） | `d8b2c03`（上游 9.14） | 仅 2 个 vbproj 变化，4 项扩展无需重移植；**尚未构建验证** |
-> | 2026-09-16 | `3fcompare-kernel-2026.9.14.2` | `d8b2c03`（上游 9.14） | 新增 A11 `preferredAdapterIndex`（PlayerApiVersion 14→15）。首次真正用 MSVC 构建本基线并通过实机验证，同时补齐了 9.14.1 缺失的构建验证 |
+> | 2026-09-16 | `3fcompare-kernel-2026.9.14.2`（`68e1965`） | `d8b2c03`（上游 9.14） | 新增 A11 `preferredAdapterIndex`（PlayerApiVersion 14→15）。首次真正用 MSVC 构建本基线并通过实机验证，同时补齐了 9.14.1 缺失的构建验证 |
+> | 2026-09-16 | `3fcompare-kernel-2026.9.14.3`（`0fe33c4`） | `d8b2c03`（上游 9.14） | 追加 issue #7 修复（PresentTimedText 与交换链改写竞态），为上游 `824093d` 的 cherry-pick |
+> | 2026-09-17 | `3fcompare-kernel-2026.9.17.1`（`b6b96a6`） | `ea3ce05`（上游 PR #8 合并后 master） | **上游已合并 PR #8**（即 issue #7 修复）。本基线 = 上游 master `ea3ce05` 与我方扩展 `68e1965` 的合并提交。`FFF.Native/` 源码与上一基线 `0fe33c4` **逐字节一致**（差异仅 README 随上游 `f551384`），故无功能差异、无 ABI 破坏——本次是**基线溯源归正**，使本地内核重新挂在上游 master 上 |
 > 本文档固化"哪些补丁必须在每次上游更新后重放"的清单，避免合并时靠记忆裁决。
 > 原则：**上游优先**——上游已有等价实现的一律不重放；仅托管 API 硬依赖且上游无等价的扩展保留。
 
