@@ -27,12 +27,11 @@
 | SetViewTransform 直写原子路径（原 0006 rev5） | `PlayerSession.cpp` `SetViewTransform`（绕过 Enqueue 命令队列直写渲染器原子量 + Redraw） | `Fff3FpEngine.SetViewTransform` ← UI 平移/缩放主路径 | 动机：命令队列在 Worker（解码）线程上执行，HD/HDR 播放时平移命令延迟数十 ms（"水平平移失效+卡顿"）。重放时保留上游的 disc 保护分支 |
 | **PreferredAdapterIndex（A11 多显卡指定解码）** | `FFF.Player.Api.h` 的 `FFF3FPConfiguration` **末尾** + `PlayerApiVersion` **递增** + `PlayerApi.cpp` 范围校验；`VideoRenderer.h/.cpp` 成员 `preferredAdapterIndex_` + `SetPreferredAdapterIndex()` + `EnsureDevice()` 指定索引优先分支；`PlayerSession.cpp` 构造期接线 | `Fff3FpEngine.ConfigVersion` **必须同步递增**（托管 `Fff3FpConfiguration` 同步加字段）；`GpuEnumeration` 必须走 **DXGI `EnumAdapters1`** | ⚠ **ABI 破坏性变更**：`FFF3FP_Create` 校验 `version != PlayerApiVersion` **严格相等**且 `size >= sizeof(config)` ⇒ 内核与托管**必须同批次发布**，错开一个版本就会让全部会话创建失败。字段**只能追加在结构体末尾**，不得移动/插入既有字段（否则静默错位）。失败时必须回落到内置 monitor 匹配策略 |
 
-## 二、已被上游吸收（不重放，更新后需复核）
+## 二、本地专用（有效，但不推上游）
 
-| 补丁 | 上游等价实现 | 复核点 |
-|---|---|---|
-| 6e7469f DWM 修复（ResizeBuffers 后 `Present(0,0)` 解除 DWM 停滞） | ✅ **已确认吸收**：`VideoRenderer.cpp` 的 EnsureSwapChain 失败恢复路径自带 `swapChain_->Present(0, 0)`（2026-09-17 核对上游 `ea3ce05`，该文件确有 `Present(0, 0)`） | 上游若重构 swapchain 恢复逻辑，确认该路径仍在 |
-| 8204c02 音频缓冲 | ⚠ **只吸收了一半，别搞混这两处**：<br>· `WasapiRenderer.cpp` 的 WASAPI **缓冲区大小** —— 上游已改为 `bufferDuration = clamp(sharedDefaultPeriod*3, 50ms, 200ms)` 自适应 ✅<br>· `PlayerSession.cpp` 的 `TargetAudioBuffer100ns` —— 这是**音频包投喂阈值**（`audioBuffered < TargetAudioBuffer100ns` 才继续喂），上游 **仍是 1'200'000（120ms）固定值**，我方改为 250ms | 250ms 是"延迟换抗欠载"：对视频对比工具合适（延迟不敏感、抗欠载优先），**但对通用播放器会增加延迟 ⇒ 不推上游**。若高码率多声道仍欠载，优先评估调上游 clamp 上限 |
+| 补丁 | 说明 |
+|---|---|
+| 8204c02 音频缓冲 250ms | `PlayerSession.cpp` 的 `TargetAudioBuffer100ns`（音频包**投喂阈值**）由 120ms 改为 250ms。性质是"延迟换抗欠载"：对视频对比工具合适（延迟不敏感、抗欠载优先），**但会增加延迟 ⇒ 不推上游**。<br>⚠ 别与 WASAPI 缓冲区混淆：`WasapiRenderer.cpp` 的 bufferDuration 上游已改为自适应 `clamp(sharedDefaultPeriod*3, 50ms, 200ms)`，那一处跟随上游即可。<br>若高码率多声道仍欠载，优先评估调上游 clamp 上限，而非继续加大此值。 |
 
 ## 三、已移除（有意不保留）
 
@@ -40,22 +39,23 @@
 |---|---|---|
 | P3 原生变速 SetSpeed（`7e85c99`：时钟斜率 + Wasapi `speed_` 缩放 + `SpeedChanged` 事件 + 渲染器 speedBits shim） | 内核完整但托管侧 0 绑定（死代码）；与 UI 伪变速（每秒 Seek）语义冲突；每次上游更新白付重移植税。2026-09-13 从 PlayerApi 导出、API 头声明/枚举、PlayerSession、WasapiRenderer、VideoRenderer 全链路移除 | 托管侧正式接线时（导出 `FFF3FP_SetSpeed`、删除 UI 伪变速、加声画漂移测试 ≤100ms），从历史提交 `7e85c99` 整体重移植 |
 
-## 四、保留但非重放义务（逐次评估）
+## 四、历史留档（已过时 / 已被上游吸收 —— **禁止重放**）
 
-> ⚠ **2026-09-17 核对结论：本类三项均已不在当前代码中。**
-> 经与上游 `ea3ce05` 逐项比对（`FF_THREAD_FRAME` / `SetMaximumFrameLatency` /
-> `interactiveMove_` try_lock 在两边都存在，`SetMaximumFrameLatency` 两边同为 **1**），
-> 确认：FLAC 多线程、P2 无锁快路径、HDR 元数据去重 + `SetMaximumFrameLatency(1→2)`
-> **都已随上游 2026.9 渲染器重构被吸收，或我方重移植时已放弃**。
-> 以下原文保留作历史留档，**不要再按它去"重放"**——重放会与上游现有实现重复甚至冲突。
-> 当前真正存在的本地补丁只有：类别一 5 项 + 类别五 2 项 + `TargetAudioBuffer100ns` 250ms。
+> **2026-09-18 复核：以下补丁均已不在当前代码中。**
+> 判据：我方 HEAD 与上游 `ea3ce05` 对 `FF_THREAD_FRAME` / `SetMaximumFrameLatency` /
+> `Present(0, 0)` 的**命中数完全相同**（1/1、1/1、1/1），说明这些符号全是上游自己的代码，
+> 我方补丁无残留 —— 即已随上游重构被吸收，或在重移植时放弃。
+>
+> 保留仅作历史记录。**严禁按此重放**：会与上游现有实现重复甚至冲突。
+> 当前真实存在的本地补丁 = 类别一 5 项 + 类别二 1 项（音频）+ 类别五 2 项。
 
-| 项 | 现状 | 评估要点 |
-|---|---|---|
-| a4a7ab0 FLAC 多线程解码（FF_THREAD_FRAME） | 在净差异中，已与上游光盘 MPEG2 低延迟分支共存 | 上游未采纳说明作者不认为音频解码是瓶颈；仅 6ch 高码率场景有收益。上游再改 OpenDecoder 时重新评估，不机械重放 |
-| P2 lock-free Render 快路径（`16f4272`，稳态 try_to_lock 跳过 deviceMutex_） | 在净差异中（VideoRenderer.cpp） | 性能热点优化（消除呈现/解码线程 mutex 对峙）但锁粒度行为最敏感；上游渲染器持续重构时**第一个放弃**。重放后必须回归 HDR/8K |
-| c941da3 HDR 元数据去重 + SetMaximumFrameLatency(1→2) | 低风险 | 上游若已做同等优化即弃 |
-| patch 0007 zoom viewport cover（b0ff668） | **未重放**：上游 shader 已删除 ViewZoom/ViewPan 常量，UV 空间缩放无处生效；上游回到视口整体放大（4 倍 zoom 时视口达源分辨率×zoom，GPU 负载随 zoom 增长） | 仅当上游重引 shader 常量或出现 4K+ 高倍缩放 GPU 尖峰实测问题时再评估；补丁永久留档于本分支历史 |
+| 补丁 | 为何过时 |
+|---|---|
+| 6e7469f DWM 修复（ResizeBuffers 后 `Present(0,0)` 解除 DWM 停滞） | 上游 `EnsureSwapChain` 失败恢复路径自带 `swapChain_->Present(0, 0)` |
+| a4a7ab0 FLAC 多线程解码（FF_THREAD_FRAME） | 上游已实现（或作者不认为音频解码是瓶颈）；不在净差异中 |
+| P2 lock-free Render 快路径（稳态 try_to_lock 跳过 `deviceMutex_`） | 上游 2026.9 渲染器重构后已有等价实现。<br>⚠ 另注：经核对 `interactiveMove_` + try_lock **本就是上游自己的代码**，历史上曾被误当作我方补丁，**不要计为本地补丁** |
+| c941da3 HDR 元数据去重 + `SetMaximumFrameLatency(1→2)` | 两边 `SetMaximumFrameLatency` 同为 **1**，该改动未保留 |
+| patch 0007 zoom viewport cover（b0ff668） | 上游 shader 已删除 ViewZoom/ViewPan 常量，UV 空间缩放无处生效；**从未重放** |
 
 ## 五、纯增量（随分支走，无重放成本）
 
