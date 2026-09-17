@@ -27,6 +27,9 @@
 | SetViewTransform 直写原子路径（原 0006 rev5） | `PlayerSession.cpp` `SetViewTransform`（绕过 Enqueue 命令队列直写渲染器原子量 + Redraw） | `Fff3FpEngine.SetViewTransform` ← UI 平移/缩放主路径 | 动机：命令队列在 Worker（解码）线程上执行，HD/HDR 播放时平移命令延迟数十 ms（"水平平移失效+卡顿"）。重放时保留上游的 disc 保护分支 |
 | **PreferredAdapterIndex（A11 多显卡指定解码）** | `FFF.Player.Api.h` 的 `FFF3FPConfiguration` **末尾** + `PlayerApiVersion` **递增** + `PlayerApi.cpp` 范围校验；`VideoRenderer.h/.cpp` 成员 `preferredAdapterIndex_` + `SetPreferredAdapterIndex()` + `EnsureDevice()` 指定索引优先分支；`PlayerSession.cpp` 构造期接线 | `Fff3FpEngine.ConfigVersion` **必须同步递增**（托管 `Fff3FpConfiguration` 同步加字段）；`GpuEnumeration` 必须走 **DXGI `EnumAdapters1`** | ⚠ **ABI 破坏性变更**：`FFF3FP_Create` 校验 `version != PlayerApiVersion` **严格相等**且 `size >= sizeof(config)` ⇒ 内核与托管**必须同批次发布**，错开一个版本就会让全部会话创建失败。字段**只能追加在结构体末尾**，不得移动/插入既有字段（否则静默错位）。失败时必须回落到内置 monitor 匹配策略 |
 
+| **Redraw（K5 导出）** | `FFF.Player.Api.h:570` 声明 + `PlayerApi.cpp:167` 实现，导出 `FFF3FP_Redraw` | `PlayerSurface.SubclassedWndProc`（子 HWND resize 后调用）→ `Fff3FpEngine.Redraw` | 让 presenter 感知尺寸变化并执行 swapchain resize + 重绘一帧。**上游无此导出** ⇒ 缺失时本地 app 直接 `EntryPointNotFoundException` | 
+| **SetLogCallback（F-LOG）** | `FFF.Player.Api.h:443` 声明 + `PlayerApi.cpp:29` 实现，导出 `FFF3FP_SetLogCallback` | `AppLog`（内核日志经 `FFF3FP_KernelLogImpl` 落盘到 `logs/app-*.log`） | 内核日志回调注册。**上游无此导出** | 
+
 ## 二、本地专用（有效，但不推上游）
 
 | 补丁 | 说明 |
