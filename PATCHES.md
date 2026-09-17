@@ -19,9 +19,14 @@
 
 每次上游更新后需人工核对签名/上下文并重移植，按维护成本从低到高排列：
 
+> ⚠ **术语澄清**：本类中 `SetPacingConfig` 的内核实现是**空操作**、`SetPresentConfig` 仅存偏好位。
+> 但它们**不是废弃项**——托管侧有活跃的 P/Invoke 调用链（`Fff3FpEngine` 会话创建时调用、
+> `MainWindow.SelfTest` 亦调用）。称其为 "shim" 只是指**对上游无价值**（上游无对应机制），
+> 若删除导出会立即 `EntryPointNotFoundException`。
+
 | 补丁 | 锚点 | 托管侧依赖 | 重移植要点 |
 |---|---|---|---|
-| SetPresentConfig / SetPacingConfig（最小 shim） | `VideoRenderer.cpp/.h`，PlayerApi 导出 `FFF3FP_SetPresentConfig` / `FFF3FP_SetPacingConfig` | `Fff3FpEngine`、`MainWindow` | tearing 存偏好位；pacing 为 no-op（上游无周期 keepalive present 可抑制） |
+| SetPresentConfig / SetPacingConfig（最小 shim，**本地仍在调用**） | `VideoRenderer.cpp/.h`，PlayerApi 导出 `FFF3FP_SetPresentConfig` / `FFF3FP_SetPacingConfig` | `Fff3FpEngine`、`MainWindow` | tearing 存偏好位；pacing 为 no-op（上游无周期 keepalive present 可抑制） |
 | GetRenderTargetInfo（K4 诊断） | `VideoRenderer.cpp/.h` 的 `RenderTargetInfo` 结构 + `lastDestX_/Y/Width/Height_` atomics；PlayerApi 导出 `FFF3FP_GetRenderTargetInfo` | `Fff3FpEngine` 轮询诊断 | `lastDest*` 由 `DrawCachedVideo` 成功路径记录——上游若重写该函数需重新锚定记录点 |
 | ReadPixelRegion（原 patch 0004，批量像素回读） | `VideoRenderer.cpp/.h`；PlayerApi 导出 `FFF3FP_ReadVideoPixelRegion` | `Fff3FpEngine.TryReadPixelRegion`（缩略图/取色） | 单次 staging 拷贝 + Map，替代逐像素 GPU 往返；依赖 `AcquireBackBufferTarget` / `DrawCachedVideo` / `swapOutputBits_`，上游渲染器重构时签名可能漂移 |
 | SetViewTransform 直写原子路径（原 0006 rev5） | `PlayerSession.cpp` `SetViewTransform`（绕过 Enqueue 命令队列直写渲染器原子量 + Redraw） | `Fff3FpEngine.SetViewTransform` ← UI 平移/缩放主路径 | 动机：命令队列在 Worker（解码）线程上执行，HD/HDR 播放时平移命令延迟数十 ms（"水平平移失效+卡顿"）。重放时保留上游的 disc 保护分支 |
