@@ -4419,13 +4419,6 @@ FFFResult PlayerVideoRenderer::SetPresentConfig(const bool enableTearing) noexce
     return FFFResult::Success;
 }
 
-FFFResult PlayerVideoRenderer::SetPacingConfig(const bool enablePacing) noexcept {
-    // A9 media-rate pacing: stored for the managed API; the upstream presenter
-    // path has no periodic keepalive presents to suppress, so this is a no-op.
-    (void)enablePacing;
-    return FFFResult::Success;
-}
-
 FFFResult PlayerVideoRenderer::GetRenderTargetInfo(RenderTargetInfo& info) noexcept {
     std::lock_guard lock(deviceMutex_);
     info = {};

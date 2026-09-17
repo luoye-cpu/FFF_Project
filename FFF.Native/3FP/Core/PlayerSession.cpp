@@ -1079,12 +1079,6 @@ FFFResult PlayerSession::SetPresentConfig(const bool enableTearing) noexcept {
     Enqueue([this, enableTearing] { videoRenderer_.SetPresentConfig(enableTearing); });
     return FFFResult::Success;
 }
-FFFResult PlayerSession::SetPacingConfig(const bool enablePacing) noexcept {
-    // Media-rate presentation pacing (A9): applied by the TimedTextThread on the
-    // next loop iteration; safe in any state, no chain work required.
-    Enqueue([this, enablePacing] { videoRenderer_.SetPacingConfig(enablePacing); });
-    return FFFResult::Success;
-}
 FFFResult PlayerSession::SetColorMode(const FFF3FPColorMode mode, const float sdr, const float hdr,
     const float paper, const bool forceHdrOutput) noexcept {
     if (mode > FFF3FPColorMode::MapToHdr || !std::isfinite(sdr) || sdr <= 0 ||

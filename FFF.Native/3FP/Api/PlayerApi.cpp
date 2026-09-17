@@ -101,11 +101,6 @@ FFFResult FFF3FP_SetPresentConfig(const FFF3FPHandle player, const std::uint32_t
         static_cast<PlayerSession*>(player)->SetPresentConfig(enableTearing != 0) :
         FFFResult::InvalidArgument;
 }
-FFFResult FFF3FP_SetPacingConfig(const FFF3FPHandle player, const std::uint32_t enablePacing) noexcept {
-    return player && enablePacing <= 1 ?
-        static_cast<PlayerSession*>(player)->SetPacingConfig(enablePacing != 0) :
-        FFFResult::InvalidArgument;
-}
 FFFResult FFF3FP_SetOutputWindow(const FFF3FPHandle player, void* window) noexcept { return player ? static_cast<PlayerSession*>(player)->SetOutputWindow(window) : FFFResult::InvalidArgument; }
 FFFResult FFF3FP_SetInteractiveMove(const FFF3FPHandle player, const std::uint32_t enabled) noexcept {
     return player && enabled <= 1 ? static_cast<PlayerSession*>(player)->SetInteractiveMove(enabled != 0)

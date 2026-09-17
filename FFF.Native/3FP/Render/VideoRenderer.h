@@ -127,10 +127,9 @@ public:
     FFFResult SetScalingQuality(FFF3FPVideoScalingQuality quality) noexcept;
     FFFResult SetViewTransform(float zoom, float panX, float panY) noexcept;
     // 3FCompare extensions kept for the managed API surface (PlayerApi exports
-    // FFF3FP_SetPresentConfig / SetPacingConfig / GetRenderTargetInfo).
+    // FFF3FP_SetPresentConfig / GetRenderTargetInfo).
     // Zoom itself follows the upstream viewport-scaling implementation.
     FFFResult SetPresentConfig(bool enableTearing) noexcept;
-    FFFResult SetPacingConfig(bool enablePacing) noexcept;
     struct RenderTargetInfo {
         std::uint32_t swapWidth = 0;
         std::uint32_t swapHeight = 0;

@@ -485,10 +485,6 @@ FFF3FP_API FFFResult FFF3FP_SetPresentConfig(FFF3FPHandle player,
 // enablePacing = 1 suppresses the timed-text thread's periodic keepalive
 // presents that would otherwise add extra flips beyond the source video frame
 // rate on VRR displays. Overlay-only updates still present at their own rate.
-// Requires tearing to be active (SetPresentConfig(1)) for full effect on VRR
-// displays; on vsync-locked displays the change is harmless (no extra flips).
-FFF3FP_API FFFResult FFF3FP_SetPacingConfig(FFF3FPHandle player,
-    std::uint32_t enablePacing) noexcept;
 FFF3FP_API FFFResult FFF3FP_SetOutputWindow(FFF3FPHandle player, void* outputWindow) noexcept;
 FFF3FP_API FFFResult FFF3FP_SetInteractiveMove(FFF3FPHandle player, std::uint32_t enabled) noexcept;
 // View transform for frame inspection: zoom scales the fitted video box
