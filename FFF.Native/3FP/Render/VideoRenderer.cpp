@@ -4694,10 +4694,18 @@ FFFResult PlayerVideoRenderer::ReadPixelRegion(const std::uint32_t x, const std:
                 out[3] = static_cast<float>((p >> 30) & 0x3u) / 3.0f;
                 out += 4;
             }
-        } else { // R16G16B16A16_FLOAT
-            const auto* rgba = reinterpret_cast<const float*>(rowPtr);
-            std::memcpy(out, rgba, static_cast<std::size_t>(copyWidth) * 4u * sizeof(float));
-            out += static_cast<std::size_t>(copyWidth) * 4u;
+        } else { // R16G16B16A16_FLOAT: each channel is HALF (2 bytes), NOT float.
+            // Must convert like the single-pixel ReadPixel does. The previous code
+            // reinterpret_cast to float* and memcpy'd copyWidth*4*sizeof(float) bytes,
+            // which is 2x the real row size => wrong values AND out-of-bounds read.
+            const auto* rgba = reinterpret_cast<const DirectX::PackedVector::HALF*>(rowPtr);
+            for (std::uint32_t col = 0; col < copyWidth; ++col) {
+                out[0] = DirectX::PackedVector::XMConvertHalfToFloat(rgba[col * 4u + 0]);
+                out[1] = DirectX::PackedVector::XMConvertHalfToFloat(rgba[col * 4u + 1]);
+                out[2] = DirectX::PackedVector::XMConvertHalfToFloat(rgba[col * 4u + 2]);
+                out[3] = DirectX::PackedVector::XMConvertHalfToFloat(rgba[col * 4u + 3]);
+                out += 4;
+            }
         }
     }
     context_->Unmap(staging.Get(), 0);
