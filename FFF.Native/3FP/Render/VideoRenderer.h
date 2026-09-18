@@ -115,7 +115,7 @@ public:
     ~PlayerVideoRenderer();
 
     FFFResult SetWindow(HWND window) noexcept;
-    // 3FCompare extension (A11): choose which DXGI adapter creates the D3D11 device.
+    // Choose which DXGI adapter creates the D3D11 device.
     // index = -1 (default) keeps the built-in policy: the adapter driving the monitor
     // that contains the output window. index >= 0 is used as the argument of
     // IDXGIFactory1::EnumAdapters1. Takes effect on the next device creation
@@ -126,9 +126,12 @@ public:
     void SetInteractiveMove(bool enabled) noexcept;
     FFFResult SetScalingQuality(FFF3FPVideoScalingQuality quality) noexcept;
     FFFResult SetViewTransform(float zoom, float panX, float panY) noexcept;
-    // 3FCompare extensions kept for the managed API surface (PlayerApi exports
-    // FFF3FP_SetPresentConfig / GetRenderTargetInfo).
-    // Zoom itself follows the upstream viewport-scaling implementation.
+    // Render-target diagnostics for the managed API surface
+    // (PlayerApi exports FFF3FP_GetRenderTargetInfo). Reports the current
+    // swap-chain / client / video-destination sizes so the App can position
+    // overlays and map pixel-probe coordinates without guessing.
+    // 3FCompare: SetPresentConfig has no upstream equivalent (PlayerApi exports
+    // FFF3FP_SetPresentConfig); zoom follows the upstream viewport-scaling impl.
     FFFResult SetPresentConfig(bool enableTearing) noexcept;
     struct RenderTargetInfo {
         std::uint32_t swapWidth = 0;
@@ -154,7 +157,7 @@ public:
     FFFResult CreateD3D11HardwareDeviceContext(AVBufferRef** context) noexcept;
     FFFResult PresentTimedText() noexcept;
     FFFResult ReadPixel(FFF3FPVideoPixelProbe& probe) noexcept;
-    // 3FCompare patch (0004): batch pixel readback (single GPU staging copy).
+    // Batch pixel readback (single GPU staging copy).
     FFFResult ReadPixelRegion(std::uint32_t x, std::uint32_t y,
         std::uint32_t width, std::uint32_t height, float* dst,
         std::uint32_t dstFloatCount, std::uint32_t* outputBitDepth) noexcept;
@@ -309,10 +312,12 @@ private:
     void SetError(std::string message) noexcept;
 
     HWND window_;
-    // 3FCompare A11: -1 = auto (adapter driving the window's monitor). See
-    // SetPreferredAdapterIndex. Deliberately a plain value: the device is created
-    // lazily and re-created on device loss, so the preference must survive both.
-    std::int32_t preferredAdapterIndex_ = -1;
+    // -1 = auto (adapter driving the window's monitor). See
+    // SetPreferredAdapterIndex. Atomic because it is written by
+    // SetPreferredAdapterIndex() (which any thread may call) and read by
+    // EnsureDevice() on the render path. The device is created lazily and
+    // re-created on device loss, so the preference must survive both.
+    std::atomic<std::int32_t> preferredAdapterIndex_{ -1 };
     ID3D11Device* device_;
     ID3D11DeviceContext* context_;
     IDXGISwapChain4* swapChain_;
@@ -374,7 +379,7 @@ private:
     bool swapHdr_;
     bool swapAllowTearing_;
     std::atomic<std::uint32_t> swapOutputBits_;
-    // Last drawn video destination rect (3FCompare K4 diagnostics shim),
+    // Last drawn video destination rect (diagnostics),
     // recorded by DrawCachedVideo after each successful shader draw.
     std::atomic<std::uint32_t> lastDestX_{ 0 };
     std::atomic<std::uint32_t> lastDestY_{ 0 };

@@ -24,6 +24,7 @@ extern "C" {
 #include <chrono>
 #include <climits>
 #include <cmath>
+#include <cstdio>
 #include <cwctype>
 #include <cstring>
 #include <mutex>
@@ -1846,7 +1847,7 @@ FFFResult PlayerVideoRenderer::SetWindow(const HWND window) noexcept {
 FFFResult PlayerVideoRenderer::SetPreferredAdapterIndex(const std::int32_t index) noexcept {
     if (index < -1 || index > 15) return FFFResult::InvalidArgument;
     std::lock_guard deviceLock(deviceMutex_);
-    preferredAdapterIndex_ = index;
+    preferredAdapterIndex_.store(index, std::memory_order_release);
     // The preference is only consulted by EnsureDevice(), i.e. at device-creation
     // time. We deliberately do not tear down an existing device here: that would
     // force a swap-chain rebuild from an arbitrary call site, and
@@ -1954,15 +1955,17 @@ FFFResult PlayerVideoRenderer::EnsureDevice() noexcept {
         D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0 };
     D3D_FEATURE_LEVEL selected{};
     ComPtr<IDXGIAdapter1> selectedAdapter;
-    // 3FCompare extension (A11): an explicitly requested adapter outranks the
+    // An explicitly requested adapter outranks the
     // monitor match. Any enumeration failure (bad index, no factory) leaves
     // selectedAdapter null so the built-in policy below still runs — the caller
     // never sees a hard failure just because a GPU preference could not be honoured.
-    if (preferredAdapterIndex_ >= 0) {
+    const auto preferredAdapterIndex =
+        preferredAdapterIndex_.load(std::memory_order_acquire);
+    if (preferredAdapterIndex >= 0) {
         ComPtr<IDXGIFactory6> preferredFactory;
         if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&preferredFactory)))) {
             preferredFactory->EnumAdapters1(
-                static_cast<UINT>(preferredAdapterIndex_), &selectedAdapter);
+                static_cast<UINT>(preferredAdapterIndex), &selectedAdapter);
         }
     }
     if (!selectedAdapter && window_ != nullptr && IsWindow(window_)) {
@@ -1990,11 +1993,14 @@ FFFResult PlayerVideoRenderer::EnsureDevice() noexcept {
         levels, ARRAYSIZE(levels), D3D11_SDK_VERSION, &device_, &selected, &context_);
     if (FAILED(result)) { SetError("Could not create the D3D11 playback device."); return FFFResult::DeviceFailure; }
 
-    // 3FCompare (A11) diagnostic: report which adapter actually backs the device.
+    // Diagnostic: report which adapter actually backs the device.
     // Without this there is no way to tell from the outside whether a requested
     // adapter index was honoured, silently ignored, or fell back to the default
     // policy — the three cases are indistinguishable in behaviour on a machine
     // where the default happens to be the same GPU.
+    // 3FCompare: the formatted line is forwarded to the process log sink
+    // (FFF3FP_SetLogCallback) as well as OutputDebugStringA, so it also lands in
+    // logs/app-*.log instead of being visible to a debugger only.
     {
         ComPtr<IDXGIDevice> dxgiDevice;
         ComPtr<IDXGIAdapter> adapter;
@@ -2002,14 +2008,18 @@ FFFResult PlayerVideoRenderer::EnsureDevice() noexcept {
             SUCCEEDED(dxgiDevice->GetAdapter(&adapter))) {
             DXGI_ADAPTER_DESC desc{};
             if (SUCCEEDED(adapter->GetDesc(&desc))) {
-                std::string line = "A11: device adapter requested=" +
-                    std::to_string(preferredAdapterIndex_) +
-                    " vendor=" + std::to_string(desc.VendorId) +
-                    " device=" + std::to_string(desc.DeviceId) +
-                    " luid=" + std::to_string(desc.AdapterLuid.HighPart) + ":" +
-                    std::to_string(desc.AdapterLuid.LowPart);
+                // Fixed-size stack buffer: EnsureDevice() is noexcept, so a
+                // std::string/std::to_string allocation here would turn an
+                // OutOfMemory into std::terminate instead of a returned error.
+                char line[192]{};
+                _snprintf_s(line, sizeof(line), _TRUNCATE,
+                    "FFF.Native: device adapter requested=%d vendor=0x%04x device=0x%04x luid=%ld:%lu",
+                    preferredAdapterIndex, desc.VendorId, desc.DeviceId,
+                    static_cast<long>(desc.AdapterLuid.HighPart),
+                    static_cast<unsigned long>(desc.AdapterLuid.LowPart));
                 extern void FFF3FP_KernelLogImpl(const char*) noexcept;
-                FFF3FP_KernelLogImpl(line.c_str());
+                FFF3FP_KernelLogImpl(line);
+                OutputDebugStringA(line);
             }
         }
     }
@@ -4410,8 +4420,7 @@ FFFResult PlayerVideoRenderer::DrawCoverBackdrop(ID3D11RenderTargetView* target)
     return FFFResult::Success;
 }
 
-// ---- 3FCompare extension shims (managed API surface; upstream has no equivalent) ----
-
+// ---- 3FCompare extension shim (managed API surface; upstream has no equivalent) ----
 FFFResult PlayerVideoRenderer::SetPresentConfig(const bool enableTearing) noexcept {
     // Preference only: the chain already carries DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING
     // when the adapter supports it; the toggle takes effect on the next Present.
@@ -4422,6 +4431,12 @@ FFFResult PlayerVideoRenderer::SetPresentConfig(const bool enableTearing) noexce
 FFFResult PlayerVideoRenderer::GetRenderTargetInfo(RenderTargetInfo& info) noexcept {
     std::lock_guard lock(deviceMutex_);
     info = {};
+    // Report "not ready" instead of an all-zero Success. A zeroed struct is
+    // indistinguishable from a real 0x0 target, and callers use these numbers to
+    // map pixel-probe coordinates, so a stale/zero swap size would silently
+    // produce wrong probe results rather than a diagnosable failure.
+    if (swapChain_ == nullptr || device_ == nullptr || context_ == nullptr)
+        return FFFResult::InvalidState;
     info.swapWidth = swapWidth_;
     info.swapHeight = swapHeight_;
     info.outputBitDepth = swapOutputBits_.load(std::memory_order_relaxed);
@@ -4542,7 +4557,7 @@ FFFResult PlayerVideoRenderer::DrawCachedVideo(ID3D11RenderTargetView* target) n
         static_cast<float>(destination.height), 0, presentationViews);
     if (result == FFFResult::Success) {
         actualVideoScalingMode_.store(FFF3FPVideoScalingMode::Shader);
-        // 3FCompare K4 diagnostics: record the drawn rect for GetRenderTargetInfo.
+        // Record the drawn rect for GetRenderTargetInfo.
         lastDestX_.store(destination.x, std::memory_order_relaxed);
         lastDestY_.store(destination.y, std::memory_order_relaxed);
         lastDestWidth_.store(destination.width, std::memory_order_relaxed);
@@ -4618,20 +4633,28 @@ FFFResult PlayerVideoRenderer::ReadPixel(FFF3FPVideoPixelProbe& probe) noexcept 
     return FFFResult::Success;
 }
 
-// 3FCompare patch (0004): batch pixel readback. One staging copy + one Map
+// Batch pixel readback. One staging copy + one Map
 // replaces the per-pixel GPU round trip used by CapturePixelSampled (~14,400
 // serialized flushes for a 320px thumbnail). Returns normalized RGBA floats
 // (range [0,1], scRGB linear for 16-bit output) in row-major order.
 FFFResult PlayerVideoRenderer::ReadPixelRegion(const std::uint32_t x, const std::uint32_t y,
     const std::uint32_t width, const std::uint32_t height, float* dst,
     const std::uint32_t dstFloatCount, std::uint32_t* outputBitDepth) noexcept {
+    // Compare in 64-bit: width * height * 4 wraps around for large requests,
+    // which would otherwise let an undersized dst buffer pass this check.
     if (dst == nullptr || width == 0 || height == 0 ||
-        dstFloatCount < width * height * 4u)
+        dstFloatCount < static_cast<std::uint64_t>(width) * height * 4u)
         return FFFResult::InvalidArgument;
     std::lock_guard deviceLock(deviceMutex_);
     if (!hasCachedVideo_ || swapChain_ == nullptr || device_ == nullptr || context_ == nullptr ||
         x >= swapWidth_ || y >= swapHeight_)
         return FFFResult::InvalidState;
+    // The header documents dst as a width x height row-major block. Truncating
+    // to the swapchain here used to return Success with a compact row pitch and
+    // untouched tail samples, which the caller cannot detect. Reject instead.
+    // Safe from underflow: x < swapWidth_ and y < swapHeight_ just above.
+    if (width > swapWidth_ - x || height > swapHeight_ - y)
+        return FFFResult::InvalidArgument;
     std::lock_guard presentLock(presentMutex_);
     ComPtr<ID3D11Texture2D> backBuffer;
     ComPtr<ID3D11RenderTargetView> target;
@@ -4648,10 +4671,14 @@ FFFResult PlayerVideoRenderer::ReadPixelRegion(const std::uint32_t x, const std:
         sourceFormat != DXGI_FORMAT_R10G10B10A2_UNORM &&
         sourceFormat != DXGI_FORMAT_R16G16B16A16_FLOAT)
         return FFFResult::NotSupported;
-    // Reuse a single staging texture sized to the request instead of creating
-    // one per call (throttled by C# side to one thumbnail at a time).
-    const auto copyWidth = std::min(width, swapWidth_ - x);
-    const auto copyHeight = std::min(height, swapHeight_ - y);
+    // NOTE: this allocates a staging texture per call. Callers are expected to
+    // throttle (the managed side serialises thumbnail requests), so the cost is
+    // acceptable; caching it would add renderer state that must stay in sync
+    // with swap-chain resizes. If readback ever becomes hot, cache it keyed on
+    // (format, width, height) and invalidate on swap-chain re-creation.
+    // Equal to width/height: the bounds check above rejected larger regions.
+    const auto copyWidth = width;
+    const auto copyHeight = height;
     D3D11_TEXTURE2D_DESC stagingDesc{};
     stagingDesc.Width = copyWidth;
     stagingDesc.Height = copyHeight;

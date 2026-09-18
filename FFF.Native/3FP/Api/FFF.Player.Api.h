@@ -105,13 +105,16 @@ struct FFF3FPConfiguration {
     void* eventCallbackContext;
     FFF3FPVideoScalingQuality videoScalingQuality;
     std::uint32_t forceHdrOutput;
-    // 3FCompare extension (A11): preferred DXGI adapter index for the D3D11 device.
+    // Preferred DXGI adapter index for the D3D11 device.
     // Use -1 (or any negative value) to keep the built-in policy: pick the adapter
     // that drives the monitor containing the output window. The index matches
     // IDXGIFactory1::EnumAdapters1 — the enumeration the managed side must use so
     // both sides agree on "which adapter is #1".
     // Out-of-range or failed enumeration falls back to the built-in policy.
-    std::int32_t preferredAdapterIndex;
+    // NOTE: 0 is a valid adapter index, NOT "unset". A host that leaves this
+    // field zeroed therefore pins playback to adapter #0 and silently overrides
+    // the monitor match, so every caller must initialise it to -1 explicitly.
+    std::int32_t preferredAdapterIndex = -1;
 };
 
 struct FFF3FPSnapshot {
@@ -481,10 +484,6 @@ FFF3FP_API FFFResult FFF3FP_SetColorMode(FFF3FPHandle player, FFF3FPColorMode mo
 // the renderer keeps the vsync path (returns NotSupported).
 FFF3FP_API FFFResult FFF3FP_SetPresentConfig(FFF3FPHandle player,
     std::uint32_t enableTearing) noexcept;
-// Media-rate presentation pacing for VRR (3FCompare extension, A9):
-// enablePacing = 1 suppresses the timed-text thread's periodic keepalive
-// presents that would otherwise add extra flips beyond the source video frame
-// rate on VRR displays. Overlay-only updates still present at their own rate.
 FFF3FP_API FFFResult FFF3FP_SetOutputWindow(FFF3FPHandle player, void* outputWindow) noexcept;
 FFF3FP_API FFFResult FFF3FP_SetInteractiveMove(FFF3FPHandle player, std::uint32_t enabled) noexcept;
 // View transform for frame inspection: zoom scales the fitted video box
@@ -508,7 +507,7 @@ FFF3FP_API FFFResult FFF3FP_SetTimedTextLayer(FFF3FPHandle player,
 FFF3FP_API FFFResult FFF3FP_GetSnapshot(FFF3FPHandle player, FFF3FPSnapshot* snapshot) noexcept;
 FFF3FP_API FFFResult FFF3FP_ReadVideoPixel(FFF3FPHandle player,
     FFF3FPVideoPixelProbe* probe) noexcept;
-// 3FCompare patch (0004): batch pixel readback. Samples a rectangular region
+// Batch pixel readback. Samples a rectangular region
 // of the presented frame in ONE staging copy + Map instead of one GPU round
 // trip per pixel. dst receives w*h RGBA32F samples (row-major, premultiplied
 // order R,G,B,A), normalized exactly like FFF3FPVideoPixelProbe fields.
@@ -542,11 +541,12 @@ FFF3FP_API FFFResult FFF3FP_GetMediaInfo(FFF3FPHandle player, char* outputUtf8,
     std::uint32_t outputSize, std::uint32_t* requiredSize) noexcept;
 FFF3FP_API FFFResult FFF3FP_GetLastError(FFF3FPHandle player, char* outputUtf8,
     std::uint32_t outputSize, std::uint32_t* requiredSize) noexcept;
-// 3FCompare K1/K5: render-target diagnostics + present hint. RenderTargetInfo
-// reports the current swapchain/client/destination sizes (for App-side overlay
-// positioning and pixel-probe coordinate mapping). Redraw() re-presents the
-// last cached frame on the presenter thread — the App calls it after a child
-// HWND resize so flips continue issuing (ResizeBuffers stays on the presenter).
+// Render-target diagnostics. RenderTargetInfo reports the
+// current swapchain/client/destination sizes (for App-side overlay positioning
+// and pixel-probe coordinate mapping).
+// Returns InvalidState when no swapchain exists yet (e.g. before the first
+// frame is presented); the contents of *info are then unspecified and must not
+// be interpreted as a 0x0 target.
 struct FFF3FPRenderTargetInfo {
     std::uint32_t size;
     std::uint32_t version; // == 1
@@ -563,6 +563,9 @@ struct FFF3FPRenderTargetInfo {
 };
 FFF3FP_API FFFResult FFF3FP_GetRenderTargetInfo(FFF3FPHandle player,
     FFF3FPRenderTargetInfo* info) noexcept;
+// 3FCompare K5: re-present the last cached frame on the presenter thread.
+// The App calls it after a child HWND resize so flips keep issuing while
+// ResizeBuffers stays on the presenter. Upstream has no equivalent export.
 FFF3FP_API FFFResult FFF3FP_Redraw(FFF3FPHandle player) noexcept;
 FFF3FP_API void FFF3FP_Destroy(FFF3FPHandle player) noexcept;
 

@@ -445,7 +445,7 @@ PlayerSession::PlayerSession(const FFF3FPConfiguration& configuration)
     LARGE_INTEGER frequency{}; QueryPerformanceFrequency(&frequency); qpcFrequency_ = frequency.QuadPart;
     if (configuration.audioEndpointIdUtf8 != nullptr) audioEndpointId_ = FromUtf8(configuration.audioEndpointIdUtf8);
     videoRenderer_.SetWindow(static_cast<HWND>(configuration.outputWindow));
-    // 3FCompare extension (A11): must be applied before the first EnsureDevice(),
+    // Must be applied before the first EnsureDevice(),
     // which happens lazily on the render path — hence here in the constructor.
     videoRenderer_.SetPreferredAdapterIndex(configuration.preferredAdapterIndex);
     videoRenderer_.SetScalingQuality(configuration.videoScalingQuality);
@@ -1165,7 +1165,7 @@ FFFResult PlayerSession::SetViewTransform(const float zoom, const float panX,
     const float panY) noexcept {
     if (!std::isfinite(zoom) || zoom <= 0.0f || !std::isfinite(panX) || !std::isfinite(panY))
         return FFFResult::InvalidArgument;
-    // 3FCompare patch (0006 rev5): bypass the playback command queue. The old
+    // Bypass the playback command queue. The old
     // Enqueue path executed the transform on the Worker (decode) thread —
     // during HD/HDR playback that thread is busy decoding for tens of ms, so
     // the queued pan commands arrived late or never before the next frame
@@ -1174,7 +1174,7 @@ FFFResult PlayerSession::SetViewTransform(const float zoom, const float panX,
     // from any thread is safe. Redraw only wakes the presenter via its fast
     // path, which also does not contend with decode.
     // Upstream 2026.9: guard disc playback (disc renderer has its own view path).
-    if (disc_) return FFFResult::Success;
+    if (discOpened_.load(std::memory_order_acquire)) return FFFResult::Success;
     const auto result = videoRenderer_.SetViewTransform(zoom, panX, panY);
     if (result != FFFResult::Success) return result;
     const auto redrawResult = videoRenderer_.Redraw();
@@ -1667,8 +1667,12 @@ FFFResult PlayerSession::GetLyricsStatus(FFF3FPTimedTextStatus& status) noexcept
     return videoRenderer_.GetTimedTextStatus(status, TimedTextLayerSlot::Lyrics);
 }
 
-// 3FCompare K1/K5: forward to the renderer (RTInfo under deviceMutex_, Redraw wake fast path).
+// Forward to the renderer (RTInfo under deviceMutex_).
 FFFResult PlayerSession::GetRenderTargetInfo(FFF3FPRenderTargetInfo& info) noexcept {
+    // Same contract as GetSnapshot: the caller declares the size and version of
+    // the struct it passes, so we never write past a smaller caller-side layout.
+    if (info.size < sizeof(FFF3FPRenderTargetInfo) || info.version != 1)
+        return FFFResult::InvalidArgument;
     info.size = sizeof(info);
     info.version = 1;
     PlayerVideoRenderer::RenderTargetInfo rtInfo{};
@@ -1687,6 +1691,7 @@ FFFResult PlayerSession::GetRenderTargetInfo(FFF3FPRenderTargetInfo& info) noexc
     return FFFResult::Success;
 }
 
+// 3FCompare K5: upstream has no equivalent.
 FFFResult PlayerSession::Redraw() noexcept {
     const auto result = videoRenderer_.Redraw();
     if (result == FFFResult::DeviceFailure)
@@ -2023,7 +2028,7 @@ void PlayerSession::DoOpen(std::string path) noexcept {
             disc_ = std::make_unique<DiscInput>(discCancel_);
             if (!disc_->Open(path) || !disc_->OpenDemux(&format_)) {
                 openResult = FFFResult::NotSupported; openError = disc_->Error();
-            }
+            } else discOpened_.store(true, std::memory_order_release);
         } catch (...) { openResult = FFFResult::NativeFailure; openError = "Could not open the disc."; }
     } else openResult = OpenFormat(path, &format_, formatIo_, openError);
     if (openResult != FFFResult::Success) { Fail(openResult, std::move(openError), "open"); return; }
@@ -3090,7 +3095,9 @@ void PlayerSession::DoClose(const FFF3FPState finalState, const bool preserveVid
     ClearVideoQueue();
     for (auto*& frame : videoFramePool_) av_frame_free(&frame);
     videoFramePool_.clear();
-    if (disc_) { disc_->CloseDemux(&format_); disc_.reset(); }
+    // Publish "closed" before releasing, so no new caller-thread entry can
+    // observe the flag after the object is gone.
+    if (disc_) { discOpened_.store(false, std::memory_order_release); disc_->CloseDemux(&format_); disc_.reset(); }
     else CloseFormat(&format_, formatIo_);
     discPositionOffset_ = 0; discGraphicsSequence_ = 0; discDrained_ = false;
     discInvalidPackets_ = 0;

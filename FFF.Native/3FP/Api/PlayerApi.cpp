@@ -7,9 +7,9 @@
 #include <atomic>
 
 namespace {
-// Bumped 14 -> 15 for the 3FCompare A11 extension (preferredAdapterIndex in
-// FFF3FPConfiguration). FFF3FP_Create rejects a mismatched version outright, so
-// the managed Fff3FpEngine.ConfigVersion MUST be bumped in lockstep.
+// Bumped 14 -> 15 because FFF3FPConfiguration gained the preferredAdapterIndex
+// field. FFF3FP_Create rejects a mismatched version outright, so
+// every consumer of this header MUST be rebuilt and bumped in lockstep.
 constexpr std::uint32_t PlayerApiVersion = 15;
 
 // 3FCompare extension (F-LOG): process-wide native log sink.
@@ -54,8 +54,8 @@ FFFResult FFF3FP_Create(const FFF3FPConfiguration* configuration, FFF3FPHandle* 
         configuration->decodeMode > FFF3FPDecodeMode::D3D11 || configuration->colorMode > FFF3FPColorMode::MapToHdr ||
         configuration->videoScalingQuality > FFF3FPVideoScalingQuality::HighQuality ||
         configuration->forceHdrOutput > 1 ||
-        // 3FCompare A11: -1 = auto (adapter driving the window's monitor); 0..15 = DXGI index.
-        // Mirrors AppSettings.Normalize() clamping on the managed side.
+        // -1 = auto (adapter driving the window's monitor); 0..15 = DXGI index.
+        // Callers are expected to clamp to the same range.
         configuration->preferredAdapterIndex < -1 || configuration->preferredAdapterIndex > 15 ||
         !std::isfinite(configuration->sdrPeakNits) || configuration->sdrPeakNits <= 0 ||
         !std::isfinite(configuration->hdrPeakNits) || configuration->hdrPeakNits < 0 ||
@@ -134,7 +134,7 @@ FFFResult FFF3FP_ReadVideoPixel(const FFF3FPHandle player,
     return player && probe ? static_cast<PlayerSession*>(player)->ReadVideoPixel(*probe) :
         FFFResult::InvalidArgument;
 }
-// 3FCompare patch (0004): batch pixel readback (single staging copy + Map).
+// Batch pixel readback (single staging copy + Map).
 FFFResult FFF3FP_ReadVideoPixelRegion(const FFF3FPHandle player,
     const std::uint32_t x, const std::uint32_t y, const std::uint32_t width,
     const std::uint32_t height, float* dst, const std::uint32_t dstFloatCount,
@@ -153,12 +153,7 @@ FFFResult FFF3FP_GetTimedTextStatus(const FFF3FPHandle player,
     return player && status ? static_cast<PlayerSession*>(player)->GetTimedTextStatus(*status)
         : FFFResult::InvalidArgument;
 }
-// 3FCompare K1/K5
-FFFResult FFF3FP_GetRenderTargetInfo(const FFF3FPHandle player,
-    FFF3FPRenderTargetInfo* info) noexcept {
-    return player && info ? static_cast<PlayerSession*>(player)->GetRenderTargetInfo(*info)
-        : FFFResult::InvalidArgument;
-}
+// 3FCompare K5: upstream has no equivalent export.
 FFFResult FFF3FP_Redraw(const FFF3FPHandle player) noexcept {
     return player ? static_cast<PlayerSession*>(player)->Redraw()
         : FFFResult::InvalidArgument;
@@ -197,4 +192,10 @@ FFFResult FFF3FP_GetMediaInfo(const FFF3FPHandle player, char* output, const std
     std::uint32_t* required) noexcept { if (!player) return FFFResult::InvalidArgument; try { return CopyUtf8(static_cast<PlayerSession*>(player)->MediaInfo(), output, size, required); } catch (...) { return FFFResult::NativeFailure; } }
 FFFResult FFF3FP_GetLastError(const FFF3FPHandle player, char* output, const std::uint32_t size,
     std::uint32_t* required) noexcept { if (!player) return FFFResult::InvalidArgument; try { return CopyUtf8(static_cast<PlayerSession*>(player)->LastError(), output, size, required); } catch (...) { return FFFResult::NativeFailure; } }
+// Render-target diagnostics
+FFFResult FFF3FP_GetRenderTargetInfo(const FFF3FPHandle player,
+    FFF3FPRenderTargetInfo* info) noexcept {
+    return player && info ? static_cast<PlayerSession*>(player)->GetRenderTargetInfo(*info)
+        : FFFResult::InvalidArgument;
+}
 void FFF3FP_Destroy(const FFF3FPHandle player) noexcept { delete static_cast<PlayerSession*>(player); }

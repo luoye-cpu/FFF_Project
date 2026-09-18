@@ -1,9 +1,9 @@
 // FFF.Native.dll 版本资源：对齐 PlayerApiVersion（PlayerApi.cpp）。
-// FileVersion 供 3FCompare NativeRuntime.ExtractEmbeddedDll 的版本比较使用，
+// FileVersion 便于在部署现场核对"这个 DLL 是哪个 API 版本编出来的"，
 // 更新内核 API 时须同步递增此处主版本号。
 #include <winver.h>
 
-// 15 = PlayerApiVersion（A11 扩展：FFF3FPConfiguration.preferredAdapterIndex）
+// 15 = PlayerApiVersion（FFF.Player.Api.h；FFF3FPConfiguration 新增 preferredAdapterIndex 字段）
 #define VER_API 15
 
 VS_VERSION_INFO VERSIONINFO
@@ -19,7 +19,7 @@ BEGIN
     BEGIN
         BLOCK "040904b0"
         BEGIN
-            VALUE "CompanyName", "3FCompare"
+            VALUE "CompanyName", "FFF_Project"
             VALUE "FileDescription", "FFF.Native - 3FP media player kernel"
             VALUE "FileVersion", "15.0.0.0"
             VALUE "InternalName", "FFF.Native"
