@@ -1,109 +1,125 @@
 # 3FCompare 内核补丁索引（PATCHES）
 
-> 基线：上游 master `ea3ce05`（2026-09-17，含已合并的 PR #8 = issue #7 修复）。
-> 本地分支：`3fcompare/integrate-issue7`，当前归档 tag `3fcompare-kernel-2026.9.17.1`（`b6b96a6`）。
-> （历史分支 `3fcompare/zoom-viewport-cover` 保留，停在 `0fe33c4`。）
+> 基线：上游 master `440e662`（2026-09-18，含已合并的 PR #8 与 **PR #9**）。
+> 本地分支：`3fc/integrate-issue7`。
 >
-> **升级记录**
-> | 日期 | 归档 tag | 上游 | 说明 |
-> |---|---|---|---|
-> | 2026-09-11 | `3fcompare-kernel-2026.9.11.1`（`6bc8d61`） | `f25c28f`（上游 9.12） | 首次 re-port |
-> | 2026-09-15 | `3fcompare-kernel-2026.9.14.1`（`025198f`） | `d8b2c03`（上游 9.14） | 仅 2 个 vbproj 变化，4 项扩展无需重移植；**尚未构建验证** |
-> | 2026-09-16 | `3fcompare-kernel-2026.9.14.2`（`68e1965`） | `d8b2c03`（上游 9.14） | 新增 A11 `preferredAdapterIndex`（PlayerApiVersion 14→15）。首次真正用 MSVC 构建本基线并通过实机验证，同时补齐了 9.14.1 缺失的构建验证 |
-> | 2026-09-16 | `3fcompare-kernel-2026.9.14.3`（`0fe33c4`） | `d8b2c03`（上游 9.14） | 追加 issue #7 修复（PresentTimedText 与交换链改写竞态），为上游 `824093d` 的 cherry-pick |
-> | 2026-09-17 | `3fcompare-kernel-2026.9.17.1`（`b6b96a6`） | `ea3ce05`（上游 PR #8 合并后 master） | **上游已合并 PR #8**（即 issue #7 修复）。本基线 = 上游 master `ea3ce05` 与我方扩展 `68e1965` 的合并提交。`FFF.Native/` 源码与上一基线 `0fe33c4` **逐字节一致**（差异仅 README 随上游 `f551384`），故无功能差异、无 ABI 破坏——本次是**基线溯源归正**，使本地内核重新挂在上游 master 上 |
+> **2026-09-18 重大变更：上游合并了 PR #9。** 该 PR 把我们长期自行维护的 5 项扩展
+> （A11 显卡指定、批量像素回读、渲染目标诊断、SetViewTransform 直写、16F/HDR 越界修复）
+> 连同版本资源一并吸收。**重移植负担从 8 项降到 4 项**（类别一 7→3，类别二 1 项不变）。
+>
 > 本文档固化"哪些补丁必须在每次上游更新后重放"的清单，避免合并时靠记忆裁决。
 > 原则：**上游优先**——上游已有等价实现的一律不重放；仅托管 API 硬依赖且上游无等价的扩展保留。
 
-## 一、必须重放（托管 API 硬依赖，上游无等价）
+## 升级记录
 
-每次上游更新后需人工核对签名/上下文并重移植，按维护成本从低到高排列：
+| 日期 | 归档 tag | 上游 | 说明 |
+|---|---|---|---|
+| 2026-09-11 | `3fcompare-kernel-2026.9.11.1`（`6bc8d61`） | `f25c28f`（上游 9.12） | 首次 re-port |
+| 2026-09-15 | `3fcompare-kernel-2026.9.14.1`（`025198f`） | `d8b2c03`（上游 9.14） | 仅 2 个 vbproj 变化，扩展无需重移植 |
+| 2026-09-16 | `3fcompare-kernel-2026.9.14.2`（`68e1965`） | `d8b2c03`（上游 9.14） | 新增 A11 `preferredAdapterIndex`（API 14→15），首次 MSVC 构建验证 |
+| 2026-09-16 | `3fcompare-kernel-2026.9.14.3`（`0fe33c4`） | `d8b2c03`（上游 9.14） | 追加 issue #7 修复（上游 `824093d` 的 cherry-pick） |
+| 2026-09-17 | `3fcompare-kernel-2026.9.17.1`（`b6b96a6`） | `ea3ce05`（PR #8 合并后） | 基线溯源归正，`FFF.Native/` 与上一基线逐字节一致 |
+| 2026-09-18 | `3fcompare-kernel-2026.9.18.1`（`ba6d875`） | `ea3ce05`（PR #8 合并后） | 新增 16F/HDR 越界修复；**PR #9 提交/合并前的最后本地态** |
+| **2026-09-18** | *（本次合并，待打 tag）* | **`440e662`（PR #9 合并后）** | **上游吸收 5 项扩展。本地残留 = 类别一 3 项 + 类别二 1 项** |
 
-> ⚠ **术语澄清**：本类中 `SetPresentConfig` 仅存偏好位（内核几乎无行为）。
-> 但它们**不是废弃项**——托管侧有活跃的 P/Invoke 调用链（`Fff3FpEngine` 会话创建时调用、
-> `MainWindow.SelfTest` 亦调用）。称其为 "shim" 只是指**对上游无价值**（上游无对应机制），
-> 若删除导出会立即 `EntryPointNotFoundException`。
+## 一、必须重放（托管 API 硬依赖，上游无等价）—— 3 项
+
+> ⚠ **术语澄清**：`SetPresentConfig` 仅存偏好位（内核几乎无行为），但**不是废弃项**——
+> 托管侧有活跃的 P/Invoke 调用链（`Fff3FpEngine`、`MainWindow.SelfTest`）。
+> 称其为 "shim" 只是指**对上游无价值**（上游无对应机制）；删除导出会立即
+> `EntryPointNotFoundException`。
 
 | 补丁 | 锚点 | 托管侧依赖 | 重移植要点 |
 |---|---|---|---|
-| SetPresentConfig（tearing 偏好位，**本地仍在调用**） | `VideoRenderer.cpp/.h`，PlayerApi 导出 `FFF3FP_SetPresentConfig` / `FFF3FP_SetPacingConfig` | `Fff3FpEngine`、`MainWindow` | 仅保留 `FFF3FP_SetPresentConfig`（tearing 偏好位）。原配对的 `SetPacingConfig` **已于 2026-09-18 全链路移除**（见类别四） |
-| GetRenderTargetInfo（K4 诊断） | `VideoRenderer.cpp/.h` 的 `RenderTargetInfo` 结构 + `lastDestX_/Y/Width/Height_` atomics；PlayerApi 导出 `FFF3FP_GetRenderTargetInfo` | `Fff3FpEngine` 轮询诊断 | `lastDest*` 由 `DrawCachedVideo` 成功路径记录——上游若重写该函数需重新锚定记录点 |
-| ReadPixelRegion（原 patch 0004，批量像素回读） | `VideoRenderer.cpp/.h`；PlayerApi 导出 `FFF3FP_ReadVideoPixelRegion` | `Fff3FpEngine.TryReadPixelRegion`（缩略图/取色） | 单次 staging 拷贝 + Map，替代逐像素 GPU 往返；依赖 `AcquireBackBufferTarget` / `DrawCachedVideo` / `swapOutputBits_`，上游渲染器重构时签名可能漂移 |
-| SetViewTransform 直写原子路径（原 0006 rev5） | `PlayerSession.cpp` `SetViewTransform`（绕过 Enqueue 命令队列直写渲染器原子量 + Redraw） | `Fff3FpEngine.SetViewTransform` ← UI 平移/缩放主路径 | 动机：命令队列在 Worker（解码）线程上执行，HD/HDR 播放时平移命令延迟数十 ms（"水平平移失效+卡顿"）。重放时保留上游的 disc 保护分支 |
-| **PreferredAdapterIndex（A11 多显卡指定解码）** | `FFF.Player.Api.h` 的 `FFF3FPConfiguration` **末尾** + `PlayerApiVersion` **递增** + `PlayerApi.cpp` 范围校验；`VideoRenderer.h/.cpp` 成员 `preferredAdapterIndex_` + `SetPreferredAdapterIndex()` + `EnsureDevice()` 指定索引优先分支；`PlayerSession.cpp` 构造期接线 | `Fff3FpEngine.ConfigVersion` **必须同步递增**（托管 `Fff3FpConfiguration` 同步加字段）；`GpuEnumeration` 必须走 **DXGI `EnumAdapters1`** | ⚠ **ABI 破坏性变更**：`FFF3FP_Create` 校验 `version != PlayerApiVersion` **严格相等**且 `size >= sizeof(config)` ⇒ 内核与托管**必须同批次发布**，错开一个版本就会让全部会话创建失败。字段**只能追加在结构体末尾**，不得移动/插入既有字段（否则静默错位）。失败时必须回落到内置 monitor 匹配策略 |
+| **Redraw（K5 导出）** | `FFF.Player.Api.h` 声明 + `PlayerApi.cpp` 实现 + `PlayerSession::Redraw` + `PlayerVideoRenderer::Redraw` | `PlayerSurface.SubclassedWndProc`（子 HWND resize 后调用）→ `Fff3FpEngine.Redraw` | 让 presenter 感知尺寸变化并 swapchain resize + 重绘一帧。**上游无此导出** ⇒ 缺失时本地 app 直接 `EntryPointNotFoundException` |
+| **SetLogCallback（F-LOG）** | `FFF.Player.Api.h` 的 `FFF3FPLogCallback` typedef + `PlayerApi.cpp` 的 `g_logSink` / `g_logContext` / `FFF3FP_KernelLogImpl` | `AppLog`（内核日志落盘到 `logs/app-*.log`） | 内核日志回调注册。**上游无此导出**。<br>⚠ `VideoRenderer.cpp` 的 `EnsureDevice()` 诊断行会 `extern` 声明并调用 `FFF3FP_KernelLogImpl`；该函数定义在 `PlayerApi.cpp`，重移植时不要漏 |
+| **SetPresentConfig（tearing 偏好位）** | `VideoRenderer.h/.cpp` 的 `SetPresentConfig(bool)` + `PlayerSession` 转发 + `PlayerApi` 导出 | `Fff3FpEngine`、`MainWindow` | 只写 `swapAllowTearing_`（该成员是**上游既有**），不新增渲染器状态。原配对的 `SetPacingConfig` 已于 2026-09-18 全链路移除 |
 
-| **Redraw（K5 导出）** | `FFF.Player.Api.h:570` 声明 + `PlayerApi.cpp:167` 实现，导出 `FFF3FP_Redraw` | `PlayerSurface.SubclassedWndProc`（子 HWND resize 后调用）→ `Fff3FpEngine.Redraw` | 让 presenter 感知尺寸变化并执行 swapchain resize + 重绘一帧。**上游无此导出** ⇒ 缺失时本地 app 直接 `EntryPointNotFoundException` | 
-| **SetLogCallback（F-LOG）** | `FFF.Player.Api.h:443` 声明 + `PlayerApi.cpp:29` 实现，导出 `FFF3FP_SetLogCallback` | `AppLog`（内核日志经 `FFF3FP_KernelLogImpl` 落盘到 `logs/app-*.log`） | 内核日志回调注册。**上游无此导出** | 
-
-## 二、本地专用（有效，但不推上游）
+## 二、本地专用（有效，但不推上游）—— 1 项
 
 | 补丁 | 说明 |
 |---|---|
-| 8204c02 音频缓冲 250ms | `PlayerSession.cpp` 的 `TargetAudioBuffer100ns`（音频包**投喂阈值**）由 120ms 改为 250ms。性质是"延迟换抗欠载"：对视频对比工具合适（延迟不敏感、抗欠载优先），**但会增加延迟 ⇒ 不推上游**。<br>⚠ 别与 WASAPI 缓冲区混淆：`WasapiRenderer.cpp` 的 bufferDuration 上游已改为自适应 `clamp(sharedDefaultPeriod*3, 50ms, 200ms)`，那一处跟随上游即可。<br>若高码率多声道仍欠载，优先评估调上游 clamp 上限，而非继续加大此值。 |
+| 音频缓冲 250ms | `PlayerSession.cpp` 的 `TargetAudioBuffer100ns`（音频包**投喂阈值**）由 120ms 改为 250ms。性质是"延迟换抗欠载"：对视频对比工具合适（延迟不敏感、抗欠载优先），**但会增加延迟 ⇒ 不推上游**。<br>⚠ 别与 WASAPI 缓冲区混淆：`WasapiRenderer.cpp` 的 bufferDuration 上游已改为自适应 `clamp(sharedDefaultPeriod*3, 50ms, 200ms)`，那一处跟随上游即可。<br>若高码率多声道仍欠载，优先评估调上游 clamp 上限，而非继续加大此值。 |
 
 ## 三、已移除（有意不保留）
 
 | 补丁 | 移除原因 | 重引入条件 |
 |---|---|---|
-| P3 原生变速 SetSpeed（`7e85c99`：时钟斜率 + Wasapi `speed_` 缩放 + `SpeedChanged` 事件 + 渲染器 speedBits shim） | 内核完整但托管侧 0 绑定（死代码）；与 UI 伪变速（每秒 Seek）语义冲突；每次上游更新白付重移植税。2026-09-13 从 PlayerApi 导出、API 头声明/枚举、PlayerSession、WasapiRenderer、VideoRenderer 全链路移除 | 托管侧正式接线时（导出 `FFF3FP_SetSpeed`、删除 UI 伪变速、加声画漂移测试 ≤100ms），从历史提交 `7e85c99` 整体重移植 |
+| P3 原生变速 SetSpeed（`7e85c99`） | 内核完整但托管侧 0 绑定（死代码）；与 UI 伪变速（每秒 Seek）语义冲突；每次上游更新白付重移植税。已从 PlayerApi 导出、API 头声明/枚举、PlayerSession、WasapiRenderer、VideoRenderer 全链路移除 | 托管侧正式接线时（导出 `FFF3FP_SetSpeed`、删除 UI 伪变速、加声画漂移测试 ≤100ms），从历史提交 `7e85c99` 整体重移植 |
 
-## 四、历史留档（已过时 / 已被上游吸收 —— **禁止重放**）
+## 四、已被上游 PR #9 吸收（2026-09-18）—— **禁止重放**
+
+> PR #9 = 上游 `a6c74b3`（Native）+ `7deabbd`（Player），合并为 `440e662`。
+> 以下各项**已在上游 `origin/master` 中**，本地保留的只是合并结果。
+> ⚠ **严禁按历史提交重放**：已实测会产生重复定义（`PlayerSession::ReadVideoPixelRegion`、
+> `PlayerApi.cpp` 的 `FFF3FP_GetRenderTargetInfo` 都重复过一次）。
+> 上游版本在若干点上**比我们的更强**（见右列），合并时**优先取上游**。
+
+| 补丁 | 本地原提交 | 上游改进（相对我们的版本） |
+|---|---|---|
+| A11 `preferredAdapterIndex`（多显卡指定） | `68e1965` | 成员改为 `= -1` 默认初始化，并注释点明"**0 是合法索引、不是未设置**" ⇒ 调用方若零值会静默钉死到 adapter #0。**托管侧仍必须显式置 -1**（`IPlayerEngine.PreferredAdapterIndex` 默认已是 -1，`AppSettings.Normalize` 钳制 -1..15） |
+| `FFF3FP_ReadVideoPixelRegion`（原 patch 0004） | 随 re-port 带入 | ① `dstFloatCount` 比较改 64 位（防 uint32 溢出）；② 越界**拒绝** `InvalidArgument`（原为静默截断返回 Success）；③ 拷贝尺寸直接取请求尺寸 |
+| `FFF3FP_GetRenderTargetInfo`（K4 诊断） | 随 re-port 带入 | ① 校验 `size` / `version`；② 无 swapchain 时返回 `InvalidState`（原为全零 Success，与真实 0x0 目标不可区分） |
+| `SetViewTransform` 直写原子路径（原 0006 rev5） | 随 re-port 带入 | 用 `std::atomic<bool> discOpened_` 替代跨线程裸读 `disc_`（消除 data race / use-after-free 窗口） |
+| 16F/HDR HALF 越界修复 | `ba6d875` | 上游 `ReadPixelRegion` 的 16F 分支本身就是 `HALF*` + `XMConvertHalfToFloat`，修复随 PR #9 一起进入上游 |
+| `FFF.Native.rc` 版本资源 | `2fc46e9` | 上游已采纳（VER_API 15）。⚠ 这是**纯本地产物被 PR #9 一并带上去了**，现已是上游的一部分，无需再维护 |
+| `.gitignore` 忽略 `vcpkg_installed/` | `11b7f6d` | 同上，已进上游 |
+
+> **附带说明**：PR #9 还带上了我们在评审中提出的加固项（越界拒绝、64 位比较、RTInfo 校验、
+> `EnsureDevice()` 内改用固定栈缓冲以避免 noexcept 下 `std::terminate`、`discOpened_` 原子）。
+> 这些已是上游代码，不再属于本地补丁。
+
+## 五、历史留档（已过时 —— **禁止重放**）
 
 > **2026-09-18 复核：以下补丁均已不在当前代码中。**
-> 判据：我方 HEAD 与上游 `ea3ce05` 对 `FF_THREAD_FRAME` / `SetMaximumFrameLatency` /
-> `Present(0, 0)` 的**命中数完全相同**（1/1、1/1、1/1），说明这些符号全是上游自己的代码，
-> 我方补丁无残留 —— 即已随上游重构被吸收，或在重移植时放弃。
->
-> 保留仅作历史记录。**严禁按此重放**：会与上游现有实现重复甚至冲突。
-> 当前真实存在的本地补丁 = 类别一 5 项 + 类别二 1 项（音频）+ 类别五 2 项。
+> 判据：我方 HEAD 与上游对 `FF_THREAD_FRAME` / `SetMaximumFrameLatency` / `Present(0, 0)`
+> 的命中数完全相同，说明这些符号全是上游自己的代码，我方补丁无残留。
 
 | 补丁 | 为何过时 |
 |---|---|
-| 6e7469f DWM 修复（ResizeBuffers 后 `Present(0,0)` 解除 DWM 停滞） | 上游 `EnsureSwapChain` 失败恢复路径自带 `swapChain_->Present(0, 0)` |
-| a4a7ab0 FLAC 多线程解码（FF_THREAD_FRAME） | 上游已实现（或作者不认为音频解码是瓶颈）；不在净差异中 |
-| P2 lock-free Render 快路径（稳态 try_to_lock 跳过 `deviceMutex_`） | 上游 2026.9 渲染器重构后已有等价实现。<br>⚠ 另注：经核对 `interactiveMove_` + try_lock **本就是上游自己的代码**，历史上曾被误当作我方补丁，**不要计为本地补丁** |
-| c941da3 HDR 元数据去重 + `SetMaximumFrameLatency(1→2)` | 两边 `SetMaximumFrameLatency` 同为 **1**，该改动未保留 |
-| patch 0007 zoom viewport cover（b0ff668） |
-| SetPacingConfig（A9 媒体率呈现节奏） | **2026-09-18 全链路移除**：内核实现为空操作，纯占一个导出位；托管侧 P/Invoke、`Fff3FpEngine` 调用、`SelfTest` 检测项、`AppSettings.VrrPacingEnabled`、设置窗口复选框与本地化条目一并删除。重建后导出数 83→82，selftest exit=0 | 上游 shader 已删除 ViewZoom/ViewPan 常量，UV 空间缩放无处生效；**从未重放** |
+| `6e7469f` DWM 修复（ResizeBuffers 后 `Present(0,0)`） | 上游 `EnsureSwapChain` 失败恢复路径自带 `swapChain_->Present(0, 0)` |
+| `a4a7ab0` FLAC 多线程解码（FF_THREAD_FRAME） | 上游已实现；不在净差异中 |
+| P2 lock-free Render 快路径 | 上游 2026.9 渲染器重构后已有等价实现。<br>⚠ `interactiveMove_` + try_lock **本就是上游自己的代码**，曾被误当作我方补丁，**不要计为本地补丁** |
+| `c941da3` HDR 元数据去重 + `SetMaximumFrameLatency(1→2)` | 两边同为 **1**，该改动未保留 |
+| patch 0007 zoom viewport cover（`b0ff668`） | 上游 shader 已删除 ViewZoom/ViewPan 常量；**从未重放** |
+| `SetPacingConfig`（A9 媒体率呈现节奏） | **2026-09-18 全链路移除**：内核实现为空操作，纯占导出位；托管侧 P/Invoke、`AppSettings.VrrPacingEnabled`、设置窗口复选框一并删除。导出数 83→82 |
 
-## 五、纯增量（随分支走，无重放成本）
+## 六、纯增量（随分支走，无重放成本）
 
-- `2fc46e9` 版本资源 `FFF.Native.rc`（FileVersion 主段 = PlayerApiVersion，**当前 15**；**升内核 API 时同步递增**，供托管 `NativeRuntime.ExtractEmbeddedDll` 版本比较）。
-  ⚠ 本行此前长期写着"当前 13"，实际当时已是 14（托管 `Fff3FpEngine.ConfigVersion` 才是真源），现已更正。
-- `11b7f6d` `.gitignore` 忽略 `vcpkg_installed/`。
+**已清空。** 原两项（`FFF.Native.rc`、`.gitignore`）已随 PR #9 进入上游，见类别四。
 
-## 六、本地补丁与 issue #7（多路随机崩溃）的关系 —— **无关**（2026-09-17 实测）
+## 七、本地补丁与 issue #7（多路随机崩溃）的关系 —— **无关**（2026-09-17 实测）
 
-用户提出质疑：本地有大量补丁，崩溃是否由它们引入？**实测结论：不是。**
+用户曾质疑：本地有大量补丁，崩溃是否由它们引入？**实测结论：不是。**
 
-**唯一的嫌疑项与证伪过程。** 本地补丁中，唯一会触及"交换链改写"的是
-`SetViewTransform` 直写路径（类别一 0006 rev5）——它绕过 `Enqueue` 后，
-`Redraw()` → `EnsureSwapChain()` 可从任意调用线程发起，而我们已证实
-"Present 撞上交换链改写"正是崩溃触发条件（把它串行化后 8 路崩溃率 56% → 12.5%）。
-
-于是做了回退实验（分支 `3fc/exp-revert-svt`，提交 `2b90a87`，产物 `kernel_revert_svt.dll`）：
-把 `PlayerSession::SetViewTransform` 改回上游 `Enqueue` 版并编译——
+**唯一的嫌疑项与证伪过程。** 本地补丁中唯一触及"交换链改写"的是
+`SetViewTransform` 直写路径（现已属上游）——把它改回上游 `Enqueue` 版并编译后，
 **8 路崩溃 5/8，同批次基线 4/8，没有下降 ⇒ 假设证伪。**
-
-（事后看也合理：zoom 只改变绘制矩形、不改变 swapchain 尺寸，`EnsureSwapChain`
-通常会 early-return，所以这条路径很少真的触发改写。）
+（分支 `3fc/exp-revert-svt`，提交 `2b90a87`。事后看也合理：zoom 只改绘制矩形、
+不改 swapchain 尺寸，`EnsureSwapChain` 通常 early-return。）
 
 **其余补丁逐一排除：**
-- A11 `preferredAdapterIndex` —— 只在 `EnsureDevice()` 建设备时生效，运行时不参与；
-- `ReadPixelRegion` / `GetRenderTargetInfo` —— 持锁与上游既有 `ReadPixel` 一致，
-  且 `--multitest` 根本不调用它们；
-- `TargetAudioBuffer100ns` 250ms —— 只影响音频包投喂，不碰 GPU/DXGI；
-- `SetPresentConfig` / `SetPacingConfig` —— 后者是 no-op；
-- 类别四三项 —— 已不在当前代码中（见该节）。
+- A11 —— 只在 `EnsureDevice()` 建设备时生效，运行时不参与；
+- `ReadPixelRegion` / `GetRenderTargetInfo` —— 持锁与上游既有 `ReadPixel` 一致，且 `--multitest` 不调用；
+- 音频 250ms —— 只影响音频包投喂，不碰 GPU/DXGI；
+- `SetPresentConfig` —— 仅偏好位；
+- 类别五各项 —— 已不在当前代码中。
 
-⇒ **不要再往"本地补丁导致崩溃"这个方向排查。** 根因是内核里跨渲染器并发 Present
-这一**上游既有设计**问题，与我们的扩展无关。
+⇒ **不要再往"本地补丁导致崩溃"方向排查。** 根因是内核跨渲染器并发 Present 这一
+**上游既有设计**问题。
 
-## 上游更新操作流程
+## 八、上游更新操作流程（2026-09-18 实测修订）
 
-1. `git fetch origin`，对照本文档逐类核对；
-2. 类别一 4 项重移植（以 PlayerApi 导出面为完成判据：`FFF3FP_SetPresentConfig` / `SetPacingConfig` / `GetRenderTargetInfo` / `ReadVideoPixelRegion` 可编译可链接）；
-3. 类别二 2 项复核上游是否仍覆盖；
-4. 类别四逐项决策（默认：FLAC 多线程与 P2 保到不能再保）；
-5. MSBuild Release x64 构建 + 托管 `dotnet build` + `3FCompare.Core.Tests` 全绿；
-6. 打新归档 tag（`3fcompare-kernel-<上游版本>.<序号>`）。
+1. `git fetch origin --prune`，对照本文档逐类核对；
+2. `git merge --no-ff --no-commit origin/master`，**逐文件解决冲突**；
+3. ⚠ **合并必产生重复定义**（两侧都新增过同一函数）⇒ 解决完冲突后**必须扫描重名**：
+   `grep -oP '^\s*\w+\s+(PlayerSession|PlayerVideoRenderer)::\w+' <file> | sort | uniq -d`；
+4. 以 PlayerApi 导出面为完成判据：Redraw / SetLogCallback / SetPresentConfig 三个本地
+   专属导出必须还在，导出总数应为 **82**，API 版本 **15**；
+5. 构建（见下）+ 托管 `dotnet build` + `3FCompare.Core.Tests` 全绿；
+6. 打新归档 tag（`3fcompare-kernel-<上游版本>.<序号>`），同步更新
+   `tools/构建全部.ps1` 的 `$KernelBaselineSha` / `$KernelBaselineTag` 与 `.3fc_kernel_sha`。
+
+> ⚠ **MSBuild.exe 在本机被安全策略拦截** ⇒ 用 `tools/build_kernel_manual.py`
+> （复放 `FFF.Native.tlog` 中 MSBuild 真实下发的 cl/rc/link 命令，输出到新 obj 目录
+> 以避免删除既有 obj）。产物校验：`tools/check_kernel_exports.py <dll>`。
