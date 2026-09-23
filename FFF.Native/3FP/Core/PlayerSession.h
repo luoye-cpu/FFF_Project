@@ -31,6 +31,7 @@ public:
     ~PlayerSession();
 
     FFFResult Open(const char* localPathUtf8) noexcept;
+    FFFResult GetImageInfo(FFF3FPImageInfo& info) const noexcept;
     FFFResult DiscNavigate(int command, int value, int y) noexcept;
     std::string DiscStatus() const;
     FFFResult CopySdrFrame(void* pixels, std::uint32_t capacity, std::uint32_t& width,

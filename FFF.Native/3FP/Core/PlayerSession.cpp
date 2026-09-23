@@ -13,6 +13,7 @@ extern "C" {
 #include <libavutil/imgutils.h>
 #include <libavutil/mastering_display_metadata.h>
 #include <libavutil/spherical.h>
+#include <libavutil/display.h>
 #include <libavutil/pixdesc.h>
 #include <libavutil/dict.h>
 #include <libavutil/samplefmt.h>
@@ -2930,6 +2931,69 @@ void PlayerSession::PumpExternalAudio() noexcept {
         DecodePacket(externalAudioDecoder_, externalAudioPacket_, false, externalFormat_);
     }
     av_packet_unref(externalAudioPacket_);
+}
+
+FFFResult PlayerSession::GetImageInfo(FFF3FPImageInfo& info) const noexcept {
+    if (info.size < sizeof(FFF3FPImageInfo) || info.version != 1) return FFFResult::InvalidArgument;
+    if (format_ == nullptr || videoStream_ < 0) return FFFResult::InvalidState;
+
+    const auto* stream = format_->streams[videoStream_];
+    const auto* parameters = stream->codecpar;
+
+    info.frameCount = stream->nb_frames > 0 ?
+        static_cast<std::int32_t>(stream->nb_frames) : -1;
+    // FFmpeg exposes no generic loop count; animated demuxers loop unless told
+    // otherwise, which OpenWithOptions is meant to cover.
+    info.loopCount = -1;
+
+    std::uint32_t flags = 0;
+    if (staticImage_) flags |= FFF3FP_IMAGE_FLAG_STATIC;
+    if (IsLoopAwareImageDemuxer(format_->iformat)) flags |= FFF3FP_IMAGE_FLAG_ANIMATED;
+    if (stream->nb_frames > 1) flags |= FFF3FP_IMAGE_FLAG_MULTI_FRAME;
+
+    const auto* frame = stillImageFrame_ != nullptr ? stillImageFrame_ : videoDecodeFrame_;
+
+    // EXIF orientation arrives as a display matrix on the decoded frame.
+    // av_display_rotation_get returns NaN when there is no usable matrix, which
+    // stays reported as unknown rather than silently meaning "no rotation".
+    info.rotationQuarterTurns = 0xFFFFFFFFu;
+    if (frame != nullptr) {
+        const auto* matrix = av_frame_get_side_data(frame, AV_FRAME_DATA_DISPLAYMATRIX);
+        if (matrix != nullptr && matrix->size >= 9 * sizeof(std::int32_t)) {
+            const auto angle = av_display_rotation_get(
+                reinterpret_cast<const std::int32_t*>(matrix->data));
+            if (angle == angle) {
+                auto normalized = angle;
+                while (normalized < 0.0) normalized += 360.0;
+                while (normalized >= 360.0) normalized -= 360.0;
+                info.rotationQuarterTurns = static_cast<std::uint32_t>(normalized / 90.0 + 0.5) % 4u;
+                flags |= FFF3FP_IMAGE_FLAG_HAS_ROTATION;
+            }
+        }
+    }
+
+    const auto pixelFormat = frame != nullptr ?
+        static_cast<AVPixelFormat>(frame->format) :
+        static_cast<AVPixelFormat>(parameters->format);
+    info.sourcePixelFormat = static_cast<std::int32_t>(pixelFormat);
+    info.sourceBitDepth = parameters->bits_per_raw_sample > 0 ?
+        static_cast<std::uint32_t>(parameters->bits_per_raw_sample) : 8u;
+    if (const auto* descriptor = av_pix_fmt_desc_get(pixelFormat)) {
+        if (descriptor->comp[0].depth > 0) info.sourceBitDepth = descriptor->comp[0].depth;
+        if ((descriptor->flags & AV_PIX_FMT_FLAG_ALPHA) != 0) flags |= FFF3FP_IMAGE_FLAG_HAS_ALPHA;
+    }
+
+    // ICC profiles arrive as frame side data from the codecs that embed them.
+    info.iccProfileSizeBytes = 0;
+    if (frame != nullptr) {
+        if (const auto* icc = av_frame_get_side_data(frame, AV_FRAME_DATA_ICC_PROFILE)) {
+            info.iccProfileSizeBytes = static_cast<std::uint32_t>(icc->size);
+            flags |= FFF3FP_IMAGE_FLAG_HAS_ICC;
+        }
+    }
+
+    info.flags = flags;
+    return FFFResult::Success;
 }
 
 void PlayerSession::FlushAtEnd() noexcept {
