@@ -54,6 +54,9 @@ Friend NotInheritable Class 播放器图片浏览控制器
         AddHandler 画面控件.图片平移拖动, AddressOf 画面控件_图片平移拖动
     End Sub
 
+    ''' <summary>模式切换后通知宿主同步界面（隐藏进度条等）。</summary>
+    Friend Event 图片模式已变化 As EventHandler
+
     Friend ReadOnly Property 图片模式已启用 As Boolean
         Get
             Return 模式菜单项.Checked
@@ -83,6 +86,7 @@ Friend NotInheritable Class 播放器图片浏览控制器
         画面控件.图片交互已启用 = 启用
         重置视图(False)
         If 显示提示 Then 操作提示(If(启用, "已启用图片模式", "已关闭图片模式"))
+        RaiseEvent 图片模式已变化(Me, EventArgs.Empty)
     End Sub
 
     ''' <summary>方向键：图片模式下 ←/→ 切换上一张/下一张，并抢下这次按键。
