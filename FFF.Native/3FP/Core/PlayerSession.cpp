@@ -4,6 +4,9 @@
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavcodec/codec_desc.h>
+#include <libavfilter/avfilter.h>
+#include <libavfilter/buffersink.h>
+#include <libavfilter/buffersrc.h>
 #include <libavcodec/packet.h>
 #include <libavformat/avformat.h>
 #include <libavutil/avutil.h>
@@ -486,6 +489,7 @@ PlayerSession::PlayerSession(const FFF3FPConfiguration& configuration)
 }
 
 PlayerSession::~PlayerSession() {
+    ReleasePrimariesCarrierFilter();
     discCancel_.store(true);
     { std::lock_guard lock(mutex_); terminate_ = true; commands_.clear(); }
     commandCondition_.notify_all();
@@ -2112,7 +2116,11 @@ void PlayerSession::DoOpen(std::string path) noexcept {
         snapshot_.videoWidth = snapshot_.videoHeight = 0; snapshot_.isHdrSource = 0;
         if (videoStream_ >= 0) { snapshot_.videoWidth = videoDecoder_->width; snapshot_.videoHeight = videoDecoder_->height; ApplyHdrState(snapshot_, videoRenderer_.HdrState()); }
         else if (coverArtFrame_ != nullptr) { snapshot_.videoWidth = coverArtFrame_->width; snapshot_.videoHeight = coverArtFrame_->height; snapshot_.isHdrSource = 0; }
-        if (snapshot_.isHdrSource == 0 && snapshot_.requestedColorMode == FFF3FPColorMode::MapToHdr) {
+        // Wide-gamut SDR sources (Display P3 photos) also need scRGB; forcing
+        // them back to SDR here would clip the gamut the renderer just agreed
+        // to carry.
+        if (snapshot_.isHdrSource == 0 && !videoRenderer_.IsWideGamutSource() &&
+            snapshot_.requestedColorMode == FFF3FPColorMode::MapToHdr) {
             snapshot_.requestedColorMode = FFF3FPColorMode::MapToSdr;
             forcedSdrOutput = true;
         }
@@ -2669,22 +2677,36 @@ void PlayerSession::PresentVideoFrame(AVFrame* frame, AVFormatContext* owner) no
     }
     const auto previousColorMode = snapshot_.actualColorMode;
     const auto firstFrameForMedia = snapshot_.framePts == AV_NOPTS_VALUE;
+    // P3 -> BT.2020 runs **before** the frame is cached and rendered, so the
+    // retained recovery frame is already converted and a device-loss redraw
+    // does not lose the gamut again.
+    const AVFrame* frameToRender = renderFrame;
+    AVFrame* gamutConverted = nullptr;
+    if (staticImage_ && owner == format_ && NeedsPrimariesCarrier(renderFrame)) {
+        if (ConvertPrimariesToBt2020(renderFrame, &gamutConverted) == FFFResult::Success &&
+            gamutConverted != nullptr) {
+            frameToRender = gamutConverted;
+        }
+    }
     if (staticImage_ && owner == format_) {
         if (stillImageFrame_ == nullptr) stillImageFrame_ = av_frame_alloc();
         if (stillImageFrame_ == nullptr) {
             Fail(FFFResult::NativeFailure, "Could not retain the still-image frame for graphics recovery.");
+            if (gamutConverted != nullptr) av_frame_free(&gamutConverted);
             return;
         }
         av_frame_unref(stillImageFrame_);
-        const auto retainResult = av_frame_ref(stillImageFrame_, renderFrame);
+        const auto retainResult = av_frame_ref(stillImageFrame_, frameToRender);
         if (retainResult < 0) {
             Fail(FFFResult::NativeFailure,
                 "Could not retain the still-image frame for graphics recovery: " +
                 FfmpegError(retainResult));
+            if (gamutConverted != nullptr) av_frame_free(&gamutConverted);
             return;
         }
     }
-    const auto renderResult = videoRenderer_.Render(renderFrame, staticImage_ && owner == format_);
+    const auto renderResult = videoRenderer_.Render(frameToRender, staticImage_ && owner == format_);
+    if (gamutConverted != nullptr) av_frame_free(&gamutConverted);
     if (renderResult != FFFResult::Success) {
         if (renderResult == FFFResult::DeviceFailure &&
             videoRenderer_.RequestRecoveryIfDeviceLost()) return;
@@ -2992,7 +3014,113 @@ FFFResult PlayerSession::GetImageInfo(FFF3FPImageInfo& info) const noexcept {
         }
     }
 
+    // Colour description. The decoded frame is authoritative when it carries
+    // one; the container parameters are the fallback.
+    auto primaries = parameters->color_primaries;
+    auto colorSpace = parameters->color_space;
+    auto transfer = parameters->color_trc;
+    if (frame != nullptr) {
+        if (frame->color_primaries != AVCOL_PRI_UNSPECIFIED) primaries = frame->color_primaries;
+        if (frame->colorspace != AVCOL_SPC_UNSPECIFIED) colorSpace = frame->colorspace;
+        if (frame->color_trc != AVCOL_TRC_UNSPECIFIED) transfer = frame->color_trc;
+    }
+    info.colorPrimaries = primaries == AVCOL_PRI_UNSPECIFIED ? -1 : static_cast<std::int32_t>(primaries);
+    info.colorSpace = colorSpace == AVCOL_SPC_UNSPECIFIED ? -1 : static_cast<std::int32_t>(colorSpace);
+    info.colorTransfer = transfer == AVCOL_TRC_UNSPECIFIED ? -1 : static_cast<std::int32_t>(transfer);
+    // Wider than Rec.709 means the colour cannot survive an SDR swap chain.
+    if (primaries == AVCOL_PRI_BT2020 || primaries == AVCOL_PRI_SMPTE431 ||
+        primaries == AVCOL_PRI_SMPTE432) {
+        flags |= FFF3FP_IMAGE_FLAG_WIDE_GAMUT;
+    }
+
     info.flags = flags;
+    return FFFResult::Success;
+}
+
+namespace {
+
+// Display P3 and DCI-P3 fit inside BT.2020, so converting to BT.2020 carries
+// the gamut **without** clipping it — which is the whole point. Converting to
+// Rec.709 instead would throw the extra colours away.
+constexpr bool IsP3Primaries(const AVColorPrimaries primaries) noexcept {
+    return primaries == AVCOL_PRI_SMPTE431 || primaries == AVCOL_PRI_SMPTE432;
+}
+
+}  // namespace
+
+bool PlayerSession::NeedsPrimariesCarrier(const AVFrame* frame) const noexcept {
+    if (frame == nullptr) return false;
+    // BT.2020 sources already travel the shader's wide-gamut path untouched.
+    return IsP3Primaries(static_cast<AVColorPrimaries>(frame->color_primaries));
+}
+
+void PlayerSession::ReleasePrimariesCarrierFilter() noexcept {
+    if (gamutGraph_ != nullptr) {
+        avfilter_graph_free(&gamutGraph_);
+        gamutSource_ = nullptr;
+        gamutSink_ = nullptr;
+        gamutSourceWidth_ = 0;
+        gamutSourceHeight_ = 0;
+        gamutSourceFormat_ = -1;
+    }
+}
+
+FFFResult PlayerSession::ConvertPrimariesToBt2020(const AVFrame* input,
+    AVFrame** output) noexcept {
+    if (input == nullptr || output == nullptr) return FFFResult::InvalidArgument;
+    *output = nullptr;
+    if (input->width <= 0 || input->height <= 0) return FFFResult::InvalidState;
+
+    if (gamutGraph_ == nullptr || gamutSourceWidth_ != input->width ||
+        gamutSourceHeight_ != input->height || gamutSourceFormat_ != input->format) {
+        ReleasePrimariesCarrierFilter();
+        const auto* bufferSource = avfilter_get_by_name("buffer");
+        const auto* bufferSink = avfilter_get_by_name("buffersink");
+        const auto* zscale = avfilter_get_by_name("zscale");
+        if (bufferSource == nullptr || bufferSink == nullptr || zscale == nullptr)
+            return FFFResult::NotSupported;
+        auto* graph = avfilter_graph_alloc();
+        if (graph == nullptr) return FFFResult::NativeFailure;
+        char arguments[192];
+        std::snprintf(arguments, sizeof(arguments),
+            "video_size=%dx%d:pix_fmt=%d:time_base=1/25:pixel_aspect=1/1",
+            input->width, input->height, input->format);
+        AVFilterContext* source = nullptr;
+        AVFilterContext* sink = nullptr;
+        AVFilterContext* gamut = nullptr;
+        auto failed = false;
+        if (avfilter_graph_create_filter(&source, bufferSource, "in", arguments,
+                nullptr, graph) < 0) failed = true;
+        if (!failed && avfilter_graph_create_filter(&sink, bufferSink, "out",
+                nullptr, nullptr, graph) < 0) failed = true;
+        // zscale infers the input primaries from the frame and is told only the
+        // output: BT.2020, the gamut the shader already understands.
+        if (!failed && avfilter_graph_create_filter(&gamut, zscale, "gamut",
+                "primaries=bt2020", nullptr, graph) < 0) failed = true;
+        if (!failed && avfilter_link(source, 0, gamut, 0) < 0) failed = true;
+        if (!failed && avfilter_link(gamut, 0, sink, 0) < 0) failed = true;
+        if (!failed && avfilter_graph_config(graph, nullptr) < 0) failed = true;
+        if (failed) {
+            avfilter_graph_free(&graph);
+            return FFFResult::FfmpegFailure;
+        }
+        gamutGraph_ = graph;
+        gamutSource_ = source;
+        gamutSink_ = sink;
+        gamutSourceWidth_ = input->width;
+        gamutSourceHeight_ = input->height;
+        gamutSourceFormat_ = input->format;
+    }
+
+    if (av_buffersrc_add_frame_flags(gamutSource_, const_cast<AVFrame*>(input),
+            AV_BUFFERSRC_FLAG_KEEP_REF) < 0) return FFFResult::FfmpegFailure;
+    auto* converted = av_frame_alloc();
+    if (converted == nullptr) return FFFResult::NativeFailure;
+    if (av_buffersink_get_frame(gamutSink_, converted) < 0) {
+        av_frame_free(&converted);
+        return FFFResult::FfmpegFailure;
+    }
+    *output = converted;
     return FFFResult::Success;
 }
 
@@ -3224,6 +3352,7 @@ void PlayerSession::DoClose(const FFF3FPState finalState, const bool preserveVid
     if (externalAudioDecoder_) avcodec_free_context(&externalAudioDecoder_); CloseFormat(&externalFormat_, externalFormatIo_);
     if (videoDecoder_) avcodec_free_context(&videoDecoder_); if (audioDecoder_) avcodec_free_context(&audioDecoder_);
     if (coverArtFrame_) av_frame_free(&coverArtFrame_);
+    ReleasePrimariesCarrierFilter();
     if (stillImageFrame_) av_frame_free(&stillImageFrame_);
     if (videoDecodeFrame_) av_frame_free(&videoDecodeFrame_);
     if (videoTransferFrame_) av_frame_free(&videoTransferFrame_);

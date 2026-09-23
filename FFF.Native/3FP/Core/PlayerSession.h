@@ -24,6 +24,8 @@ struct AVFormatContext;
 struct AVFrame;
 struct AVPacket;
 struct AVBufferRef;
+struct AVFilterGraph;
+struct AVFilterContext;
 
 class PlayerSession final {
 public:
@@ -32,6 +34,13 @@ public:
 
     FFFResult Open(const char* localPathUtf8) noexcept;
     FFFResult GetImageInfo(FFF3FPImageInfo& info) const noexcept;
+
+    // Wide-gamut carrier: P3 sources are converted to BT.2020 once, because the
+    // shader only knows Rec.709 and Rec.2020, and an SDR swap chain cannot hold
+    // P3 at all. Still images only — video keeps its existing path.
+    bool NeedsPrimariesCarrier(const AVFrame* frame) const noexcept;
+    FFFResult ConvertPrimariesToBt2020(const AVFrame* input, AVFrame** output) noexcept;
+    void ReleasePrimariesCarrierFilter() noexcept;
     FFFResult DiscNavigate(int command, int value, int y) noexcept;
     std::string DiscStatus() const;
     FFFResult CopySdrFrame(void* pixels, std::uint32_t capacity, std::uint32_t& width,
@@ -216,6 +225,14 @@ private:
     std::int32_t coverArtStream_;
     AVFrame* coverArtFrame_;
     AVFrame* stillImageFrame_;
+    // Primaries-carrier filter graph (P3 -> BT.2020), built on demand for a
+    // single still image and kept until the next open.
+    AVFilterGraph* gamutGraph_ = nullptr;
+    AVFilterContext* gamutSource_ = nullptr;
+    AVFilterContext* gamutSink_ = nullptr;
+    int gamutSourceWidth_ = 0;
+    int gamutSourceHeight_ = 0;
+    int gamutSourceFormat_ = -1;
     AVFormatContext* externalFormat_;
     std::unique_ptr<SharedFileInput> externalFormatIo_;
     AVCodecContext* externalAudioDecoder_;

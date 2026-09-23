@@ -542,6 +542,9 @@ struct FFF3FPImageInfo {
     std::int32_t  sourcePixelFormat;     // AVPixelFormat as reported by FFmpeg
     std::uint32_t sourceBitDepth;
     std::uint32_t iccProfileSizeBytes;   // 0 when absent
+    std::int32_t  colorPrimaries;        // AVColorPrimaries; <0 unknown
+    std::int32_t  colorSpace;            // AVColorSpace; <0 unknown
+    std::int32_t  colorTransfer;         // AVColorTransfer; <0 unknown
     std::uint32_t reserved[4];
 };
 
@@ -551,6 +554,10 @@ struct FFF3FPImageInfo {
 #define FFF3FP_IMAGE_FLAG_HAS_ALPHA    0x8u
 #define FFF3FP_IMAGE_FLAG_HAS_ICC      0x10u
 #define FFF3FP_IMAGE_FLAG_HAS_ROTATION 0x20u
+// Source primaries wider than Rec.709 (BT.2020, DCI-P3, Display P3). Displaying
+// these without clipping requires the scRGB (HDR) output path; an SDR swap
+// chain cannot hold colours outside Rec.709.
+#define FFF3FP_IMAGE_FLAG_WIDE_GAMUT   0x40u
 
 // Report what a still or animated image actually contains: frame count, EXIF
 // rotation, pixel format / bit depth and whether an ICC profile is embedded.
