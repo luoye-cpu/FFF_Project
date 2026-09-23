@@ -326,6 +326,27 @@ bool IsStaticImageDemuxer(const AVInputFormat* inputFormat) noexcept {
         (name.size() > 5 && name.ends_with("_pipe"));
 }
 
+// Whether a stream is a still image is decided by what the file actually
+// contains, not by which demuxer happened to claim it. Matching demuxer names
+// cannot keep up with FFmpeg: AVIF and HEIC are ISOBMFF files that the mov
+// demuxer opens, so they never matched "image2" / "*_pipe" and were handled as
+// timed video — no retained frame, a hardware decoder attempted, and a
+// one-frame timeline that ends immediately. A single frame with no notion of
+// looping is the signal that actually matters.
+// nb_frames is unknown (0) for many sources; those fall back to the demuxer
+// name so existing behaviour is preserved exactly.
+bool IsStillImage(const AVFormatContext* format, const std::int32_t streamIndex) noexcept {
+    if (format == nullptr || streamIndex < 0 ||
+        streamIndex >= static_cast<std::int32_t>(format->nb_streams)) return false;
+    // Animated image formats stay timed video even when they report one frame:
+    // they have a real timeline and are expected to play.
+    if (IsLoopAwareImageDemuxer(format->iformat)) return false;
+    const auto frameCount = format->streams[streamIndex]->nb_frames;
+    if (frameCount > 1) return false;  // image sequences and multi-frame sources are video
+    if (frameCount == 1) return true;
+    return IsStaticImageDemuxer(format->iformat);
+}
+
 // Largest still-image side the renderer can upload in one piece.
 // D3D11 guarantees D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION (16384) on feature
 // level 11 hardware; a still image becomes a single texture, so anything wider
@@ -2021,7 +2042,7 @@ void PlayerSession::DoOpen(std::string path) noexcept {
     } else openResult = OpenFormat(path, &format_, formatIo_, openError);
     if (openResult != FFFResult::Success) { Fail(openResult, std::move(openError), "open"); return; }
     videoStream_ = FindDefaultOrFirstStream(format_, AVMEDIA_TYPE_VIDEO);
-    staticImage_ = videoStream_ >= 0 && IsStaticImageDemuxer(format_->iformat);
+    staticImage_ = IsStillImage(format_, videoStream_);
     // Still images are uploaded as one texture, so an oversized source can only
     // fail later inside the renderer ("open-image" with an opaque reason).
     // Reject it here with the real limit instead. Video is not checked here and
