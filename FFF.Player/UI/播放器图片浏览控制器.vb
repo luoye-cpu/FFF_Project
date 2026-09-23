@@ -114,11 +114,16 @@ Friend NotInheritable Class 播放器图片浏览控制器
 
     Private Sub 画面控件_图片平移拖动(sender As Object, e As 播放器图片平移拖动事件参数)
         If 已释放 OrElse Not 图片模式已启用 Then Return
+        If 缩放值 <= 1.0F Then Return  ' 未放大时没有可平移的余量
         Dim 宽度 = Math.Max(1, 画面控件.Width)
         Dim 高度 = Math.Max(1, 画面控件.Height)
-        ' 位移换算到内核约定的归一化偏移 [-1,1]（相对未缩放画面）。
-        水平平移值 = Math.Clamp(水平平移值 - (CSng(e.水平位移) / 宽度) * 2.0F / 缩放值, -1.0F, 1.0F)
-        垂直平移值 = Math.Clamp(垂直平移值 - (CSng(e.垂直位移) / 高度) * 2.0F / 缩放值, -1.0F, 1.0F)
+        ' 对齐内核语义：内核按 offsetX = pan * (zoom - 1) / 2 * 目标宽 平移，
+        ' 反解出"拖多少像素等于多少 pan"，平移才跟手（此前用 zoom 当分母，
+        ' 且方向相反：鼠标右移画面却向左跑）。
+        Dim 水平余量 = 宽度 * (缩放值 - 1.0F) / 2.0F
+        Dim 垂直余量 = 高度 * (缩放值 - 1.0F) / 2.0F
+        水平平移值 = Math.Clamp(水平平移值 + CSng(e.水平位移) / 水平余量, -1.0F, 1.0F)
+        垂直平移值 = Math.Clamp(垂直平移值 + CSng(e.垂直位移) / 垂直余量, -1.0F, 1.0F)
         提交视图()
     End Sub
 
