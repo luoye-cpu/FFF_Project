@@ -34,6 +34,7 @@ Public Class Form1
     Private 流选择器 As 播放器流选择器
     Private 画面菜单控制器 As 播放器画面菜单控制器
     Private 视角360控制器 As 播放器360视角控制器
+    Private 图片浏览控制器 As 播放器图片浏览控制器
     Private 显示器唤醒 As 显示器唤醒请求
     Private 按钮图标 As 播放器按钮图标资源
     Private 设置窗口 As Form设置
@@ -154,6 +155,16 @@ Public Class Form1
                 播放控制器.设置360视角(启用, 水平角度, 垂直角度, 视场角)
             End Sub,
             Sub(文本) 信息图层呈现器?.显示操作信息(文本, &HFF69DF8BUI, "360°视频"))
+        图片浏览控制器 = New 播放器图片浏览控制器(
+            画面控件, MCM_标题栏菜单,
+            Sub(缩放, 水平平移, 垂直平移)
+                播放控制器.设置视图变换(缩放, 水平平移, 垂直平移)
+            End Sub,
+            Sub(方向) 播放相邻项目(方向),
+            Sub(文本) 信息图层呈现器?.显示操作信息(文本, &HFF69DF8BUI, "图片"))
+        ' 图片模式通过 Form1 既有的 Handled 抢键机制接管 ←/→，
+        ' 视频模式那条"±5 秒跳转"分支不用改一个字。
+        AddHandler 方向键快捷键已请求, AddressOf 图片浏览控制器.处理方向键快捷键
         画面菜单控制器.应用全局字体(设置.实例对象.字体)
         光盘控制器 = New 播放器光盘控制器(Me, 画面控件, 播放控制器, MCM_标题栏菜单)
         全屏交互控制器 = New 播放器全屏交互控制器(Me, 画面控件,
@@ -348,6 +359,8 @@ Public Class Form1
         RemoveHandler ThisIsYourWindow1.FullScreenChanged, AddressOf ThisIsYourWindow1_FullScreenChanged
         全屏交互控制器?.Dispose()
         视角360控制器?.Dispose()
+        RemoveHandler 方向键快捷键已请求, AddressOf 图片浏览控制器.处理方向键快捷键
+        图片浏览控制器?.Dispose()
         光盘控制器?.Dispose()
         画面菜单控制器?.Dispose()
         窗口布局控制器?.释放()
@@ -501,6 +514,7 @@ Public Class Form1
         界面呈现器.媒体已打开(e.保留剪辑区间)
         界面呈现器.更新媒体信息(e.媒体信息, e.快照)
         视角360控制器?.媒体已打开(e.文件路径, e.媒体信息, e.快照)
+        图片浏览控制器?.媒体已打开(e.媒体信息, e.快照)
         界面呈现器.刷新()
     End Sub
 

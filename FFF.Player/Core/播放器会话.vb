@@ -210,6 +210,15 @@ Public NotInheritable Class 播放器会话
         检查结果(播放器原生接口.FFF3FP_Set360View(取得句柄(), If(启用, 1UI, 0UI),
                                                 水平角度, 垂直角度, 视场角))
     End Sub
+
+    ''' <summary>图片模式：设置缩放与平移。缩放=1 表示适应窗口。</summary>
+    Public Sub 设置视图变换(缩放 As Single, 水平平移 As Single, 垂直平移 As Single)
+        If Not Single.IsFinite(缩放) OrElse 缩放 <= 0.0F OrElse
+            Not Single.IsFinite(水平平移) OrElse Not Single.IsFinite(垂直平移) Then
+            Throw New ArgumentOutOfRangeException(NameOf(缩放))
+        End If
+        检查结果(播放器原生接口.FFF3FP_SetViewTransform(取得句柄(), 缩放, 水平平移, 垂直平移))
+    End Sub
     Public Sub 设置音频端点(端点标识 As String)
         Dim 指针 = IntPtr.Zero
         Try

@@ -286,6 +286,17 @@ Public NotInheritable Class 播放器控制器
         End Try
     End Sub
 
+    ''' <summary>图片模式：缩放 + 平移（转发到会话层，失败静默）。</summary>
+    Friend Sub 设置视图变换(缩放 As Single, 水平平移 As Single, 垂直平移 As Single)
+        Dim 目标 = 会话
+        If 已释放 OrElse 目标 Is Nothing Then Return
+        Try
+            目标.设置视图变换(缩放, 水平平移, 垂直平移)
+        Catch ex As ObjectDisposedException
+        Catch ex As 播放器异常
+        End Try
+    End Sub
+
     Public Sub 打开媒体(路径 As String)
         If 已释放 OrElse Not 光盘路径.媒体存在(路径) Then Return
         启动后台任务(打开媒体Async(路径))

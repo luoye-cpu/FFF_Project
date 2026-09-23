@@ -393,6 +393,12 @@ Friend Module 播放器原生接口
                                       水平角度 As Single, 垂直角度 As Single,
                                       视场角 As Single) As 原生播放器结果
     End Function
+    ' 图片模式：缩放 + 平移。zoom=1 为适应窗口，pan 为相对未缩放画面的归一化偏移 [-1,1]。
+    <DllImport(动态库名称, CallingConvention:=CallingConvention.Cdecl, ExactSpelling:=True)>
+    Friend Function FFF3FP_SetViewTransform(播放器 As 播放器原生句柄,
+                                            缩放 As Single, 水平平移 As Single,
+                                            垂直平移 As Single) As 原生播放器结果
+    End Function
     <DllImport(动态库名称, CallingConvention:=CallingConvention.Cdecl, ExactSpelling:=True)>
     Friend Function FFF3FP_SetAudioEndpoint(播放器 As 播放器原生句柄, 端点UTF8 As IntPtr) As 原生播放器结果
     End Function
