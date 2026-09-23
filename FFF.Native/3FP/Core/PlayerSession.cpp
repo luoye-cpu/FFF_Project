@@ -326,6 +326,14 @@ bool IsStaticImageDemuxer(const AVInputFormat* inputFormat) noexcept {
         (name.size() > 5 && name.ends_with("_pipe"));
 }
 
+// Largest still-image side the renderer can upload in one piece.
+// D3D11 guarantees D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION (16384) on feature
+// level 11 hardware; a still image becomes a single texture, so anything wider
+// or taller cannot be displayed at all. Rejecting up front turns a confusing
+// render failure into an actionable message. Only still images are checked —
+// video frames stay on the existing path unchanged.
+constexpr std::int32_t MaxStillImageDimension = 16384;
+
 std::int64_t EstimateDuration100ns(const AVFormatContext* format) noexcept {
     if (format == nullptr) return 0;
     if (format->duration > 0)
@@ -2014,6 +2022,23 @@ void PlayerSession::DoOpen(std::string path) noexcept {
     if (openResult != FFFResult::Success) { Fail(openResult, std::move(openError), "open"); return; }
     videoStream_ = FindDefaultOrFirstStream(format_, AVMEDIA_TYPE_VIDEO);
     staticImage_ = videoStream_ >= 0 && IsStaticImageDemuxer(format_->iformat);
+    // Still images are uploaded as one texture, so an oversized source can only
+    // fail later inside the renderer ("open-image" with an opaque reason).
+    // Reject it here with the real limit instead. Video is not checked here and
+    // keeps its existing behaviour.
+    if (staticImage_) {
+        const auto* imageParameters = format_->streams[videoStream_]->codecpar;
+        if (imageParameters->width > MaxStillImageDimension ||
+            imageParameters->height > MaxStillImageDimension) {
+            Fail(FFFResult::NotSupported,
+                "The still image is too large to display: " +
+                std::to_string(imageParameters->width) + "x" +
+                std::to_string(imageParameters->height) +
+                " exceeds the limit of " + std::to_string(MaxStillImageDimension) +
+                " pixels per side.", "open-image-size");
+            return;
+        }
+    }
     coverArtStream_ = FindCoverArtStream(format_);
     audioStream_ = FindDefaultOrFirstStream(format_, AVMEDIA_TYPE_AUDIO);
     if (videoStream_ < 0 && audioStream_ < 0) { Fail(FFFResult::NotSupported, "The file contains no playable video or audio stream.", "open"); return; }
@@ -2920,6 +2945,17 @@ void PlayerSession::FlushAtEnd() noexcept {
         endPosition += lastVideoFrameDuration100ns_;
     if (audioRenderer_) endPosition = std::max(endPosition, audioRenderer_->Position100ns());
     if (!staticImage_ && ClockPosition() < endPosition) { Sleep(1); return; }
+    // A still image never "finishes playing": it has no timeline and its frame
+    // stays on screen. Entering Ended here only makes hosts treat a freshly
+    // opened picture as finished playback (auto-advance, loop, stop) and emits a
+    // PlaybackEnded that means nothing for a picture. Stay interactive instead —
+    // zoom, pan and switching pictures must keep working after the frame lands.
+    if (staticImage_) {
+        RebuildMediaInfo();
+        SuspendAudioRenderer(true);
+        if (state_.load() == FFF3FPState::Playing) SetState(FFF3FPState::Paused, "end-still-image");
+        return;
+    }
     snapshot_.duration100ns = std::max(snapshot_.duration100ns, endPosition);
     snapshot_.position100ns = snapshot_.duration100ns;
     RebuildMediaInfo();
@@ -2936,6 +2972,12 @@ void PlayerSession::DoSeek(std::int64_t position, const std::int64_t targetFrame
         return;
     }
     if (!format_) return; position = std::clamp<std::int64_t>(position, 0, snapshot_.duration100ns > 0 ? snapshot_.duration100ns : position);
+    // A still image has no timeline to move along, and the single-image
+    // demuxers (image2 and friends) are not seekable: av_seek_frame fails, the
+    // byte-position fallback fails too, and every attempt ends in ReportError.
+    // Hosts that poll or re-synchronise periodically therefore spam errors on
+    // any opened picture. Treat the request as a no-op that keeps the picture.
+    if (staticImage_) { PublishSnapshot(); return; }
     auto decodeStartPosition = position;
     const auto referenceStream = videoStream_ >= 0 ? videoStream_ : audioStream_;
     auto timestamp = av_rescale_q(position + TimelineOrigin100ns(format_),
