@@ -1693,7 +1693,7 @@ FFF3FP_API FFFResult FFF3FP_CopyFrameSideDataAfter(FFF3FPHandle player,
 // of the bytes it hands back.
 //
 // Why stream-level. A container configuration record (the kind that decides,
-// for example, how a HDRdp-Vision stream must be processed) belongs to the
+// for example, how a dynamic-metadata stream must be processed) belongs to the
 // media stream, not to an individual packet or frame: the demuxer declares it
 // once when the stream is bound (AVCodecParameters::coded_side_data) and does
 // not re-send it per frame. A per-frame ring therefore can never carry it.
