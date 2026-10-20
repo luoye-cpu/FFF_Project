@@ -763,8 +763,15 @@ std::string HardwareAccelerationName(const AVCodecContext* decoder) {
 }
 }
 
+// "No preference" is answered, not refused: the GPU is the default route and the
+// CPU is what a refusal falls back to. Every decision downstream reads decodeMode_,
+// so normalizing once here keeps the rest of the session a two-valued question
+// (D3D11 or Cpu) and has the snapshot report the route that is actually attempted.
 PlayerSession::PlayerSession(const FFF3FPConfiguration& configuration)
-    : decodeMode_(configuration.decodeMode), callback_(configuration.eventCallback),
+    : decodeMode_(configuration.decodeMode == FFF3FPDecodeMode::Unspecified
+              ? FFF3FPDecodeMode::Gpu
+              : configuration.decodeMode),
+      callback_(configuration.eventCallback),
       callbackContext_(configuration.eventCallbackContext), terminate_(false), format_(nullptr),
       playbackPacket_(nullptr), stillImagePacket_(nullptr), externalAudioPacket_(nullptr), videoDecodeFrame_(nullptr),
       videoTransferFrame_(nullptr), audioDecodeFrame_(nullptr), externalAudioDecodeFrame_(nullptr),
@@ -793,7 +800,7 @@ PlayerSession::PlayerSession(const FFF3FPConfiguration& configuration)
       internalAudioFailureResult_(FFFResult::Success), internalAudioDecodeErrorCount_(0) {
     snapshot_ = {};
     snapshot_.size = sizeof(snapshot_); snapshot_.version = 20; snapshot_.state = FFF3FPState::Idle;
-    snapshot_.decodeMode = configuration.decodeMode; snapshot_.requestedColorMode = configuration.colorMode;
+    snapshot_.decodeMode = decodeMode_; snapshot_.requestedColorMode = configuration.colorMode;
     snapshot_.actualColorMode = FFF3FPColorMode::MapToSdr; snapshot_.frameIndex = -1;
     snapshot_.framePts = AV_NOPTS_VALUE; snapshot_.selectedVideoStream = -1; snapshot_.selectedAudioStream = -1;
     LARGE_INTEGER frequency{}; QueryPerformanceFrequency(&frequency); qpcFrequency_ = frequency.QuadPart;
@@ -6161,10 +6168,21 @@ void PlayerSession::DoSelectStream(const std::int32_t index, const bool video) n
         ClearPendingPackets();
     } else DoSeek(snapshot_.position100ns);
     RebuildMediaInfo();
-    if (video && snapshot_.decodeMode != previousDecodeMode)
+    if (video && snapshot_.decodeMode != previousDecodeMode) {
+        // Same shape as every other route change: "type" names the subsystem and the
+        // fallback flag tells a host that surfaces this event that the GPU route was
+        // given up rather than chosen. A track the GPU cannot decode is exactly that,
+        // and without the flag the host reports a graphics-device change the user
+        // never experienced (and resets screen-capture routing for nothing).
+        const auto fellBackToCpu = previousDecodeMode == FFF3FPDecodeMode::Gpu &&
+            snapshot_.decodeMode == FFF3FPDecodeMode::Cpu;
         Emit(FFF3FPEvent::DeviceChanged,
-            "{\"decodeMode\":" + std::to_string(static_cast<unsigned>(snapshot_.decodeMode)) +
-            ",\"reason\":\"The selected video stream changed the active decoder.\"}");
+            "{\"type\":\"video\",\"decodeMode\":" + std::to_string(static_cast<unsigned>(snapshot_.decodeMode)) +
+            ",\"fallback\":" + (fellBackToCpu ? "true" : "false") +
+            ",\"reason\":\"" + EscapeJson(fellBackToCpu
+                ? "The selected video stream cannot be decoded on the GPU; playback is using CPU decoding."
+                : "The selected video stream changed the active decoder.") + "\"}");
+    }
     Emit(FFF3FPEvent::OperationCompleted, std::string("{\"operation\":\"select-") + (video ? "video" : "audio") + "\",\"stream\":" + std::to_string(index) + "}");
 }
 

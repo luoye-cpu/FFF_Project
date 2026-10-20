@@ -380,6 +380,9 @@ private:
     static bool NormalizeLocalPath(const char* pathUtf8, std::string& normalized,
         std::string& error) noexcept;
 
+    // The route the host asked for, normalized in the constructor: Unspecified
+    // ("no preference") becomes Gpu, which is the GPU-first default -- the CPU is
+    // what a hardware refusal falls back to, never what is asked for up front.
     FFF3FPDecodeMode decodeMode_;
     // See SetComparisonMode(). Plain bool: only ever touched on the host's
     // calling thread, never read from the render thread.
