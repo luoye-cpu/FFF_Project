@@ -3133,6 +3133,15 @@ bool PlayerSession::HardwareDecoderProducesFrame(AVFormatContext* owner, const s
     bool produced = false;
     std::string detail;
     if (streamCountMatches) {
+        // First frame only, and that is the intended scope. A frame coming out of the
+        // decoder answers the question this gate asks -- this backend can decode this
+        // stream -- because the decoder configuration has already been negotiated and
+        // the first frame is the one that exercises it. A decoder that fails on a later
+        // frame is a different failure (a damaged slice, a mid-stream format change)
+        // and it is handled where it happens, by the pre-existing fallback in
+        // DecodePacket, which rewinds and rebuilds once instead of guessing per frame.
+        // Decoding N frames here would add demux and decode work to every open without
+        // answering a second question, so N stays 1.
         // Enough packets to cover a decoder with output delay plus a reopened GOP;
         // stop as soon as a frame arrives, which for nearly every stream is the first
         // packet of the stream.
