@@ -407,6 +407,31 @@ bool HardwareCapabilityTrace() noexcept {
     return GetEnvironmentVariableW(L"FFF3FP_HWCAP_TRACE", nullptr, 0) != 0;
 }
 
+// Remembering a refused hardware route skips the second attempt. On by default
+// because the memory only covers answers the GPU itself gave; FFF3FP_HWCAP_MEMORY=0
+// restores "ask again every time" for A/B work.
+bool HardwareRouteMemoryEnabled() noexcept {
+    wchar_t value[8]{};
+    if (GetEnvironmentVariableW(L"FFF3FP_HWCAP_MEMORY", value, 8) == 0) return true;
+    return !(value[0] == L'0' && value[1] == L'\0');
+}
+
+// What the hardware route is capable of depends on the codec, the profile, the pixel
+// format and the frame size, and on nothing else in the stream description. Two files
+// that agree on those four agree on the answer, which is what makes a key out of them
+// safe to reuse.
+std::uint64_t HardwareRouteKey(const AVCodecParameters* parameters) noexcept {
+    if (parameters == nullptr) return 0;
+    const auto mix = [](const std::uint64_t value, const std::uint64_t seed) noexcept {
+        return seed ^ (value + 0x9e3779b97f4a7c15ull + (seed << 6) + (seed >> 2));
+    };
+    auto key = mix(static_cast<std::uint32_t>(parameters->codec_id), 0ull);
+    key = mix(static_cast<std::uint32_t>(parameters->profile), key);
+    key = mix(static_cast<std::uint32_t>(parameters->format), key);
+    key = mix(static_cast<std::uint32_t>(parameters->width), key);
+    return mix(static_cast<std::uint32_t>(parameters->height), key);
+}
+
 AVPixelFormat FindHardwareFormat(const AVCodec* codec, const AVHWDeviceType deviceType) noexcept {
     if (codec == nullptr) return AV_PIX_FMT_NONE;
     const auto expectedFormat = deviceType == AV_HWDEVICE_TYPE_D3D11VA
@@ -1941,7 +1966,12 @@ bool PlayerSession::RecoverVideoDevice() noexcept {
     bool hardwareFallback = false;
     std::string hardwareFailureReason;
     if (format_ != nullptr && videoStream_ >= 0) {
-        if (decodeMode_ == FFF3FPDecodeMode::D3D11) {
+        // The device is new, so a stream the GPU refused before is worth asking about
+        // again -- unless the refusal was about the stream rather than the device, in
+        // which case it is remembered and the attempt is skipped here too.
+        const auto tryHardware = decodeMode_ == FFF3FPDecodeMode::D3D11 &&
+            !HardwareRouteKnownUnsupported(format_->streams[videoStream_]);
+        if (tryHardware) {
             result = OpenHardwareVideoDecoder(format_, videoStream_, &videoDecoder_,
                 &hardwareFailureReason);
             if (result != FFFResult::Success) {
@@ -1952,6 +1982,10 @@ bool PlayerSession::RecoverVideoDevice() noexcept {
         } else {
             result = OpenDecoder(format_, videoStream_, true, &videoDecoder_,
                 -1, nullptr, false);
+            if (result == FFFResult::Success && decodeMode_ == FFF3FPDecodeMode::D3D11) {
+                hardwareFallback = true;
+                hardwareFailureReason = "The GPU decoder was rejected for this stream earlier in this session; playback is using CPU decoding.";
+            }
         }
         if (result != FFFResult::Success) {
             Fail(result, "Could not reopen the video decoder after rebuilding the graphics device.",
@@ -3029,6 +3063,12 @@ FFFResult PlayerSession::OpenHardwareVideoDecoder(AVFormatContext* owner, const 
     // in VideoRenderer is what carries it.
     const std::size_t backendCount = staticImage_ ? 1u : std::size(Backends);
     std::string lastFailure = "No compatible hardware decoder was found.";
+    // What this refusal says, told apart for the memory written at the end: only an
+    // answer the GPU itself gave is worth remembering (see the comment on
+    // HardwareRouteKnownUnsupported). A decoder that never opened says nothing.
+    std::size_t hardwareCandidates = 0;
+    std::size_t decoderOpenFailures = 0;
+    std::size_t trialRefusals = 0;
     for (std::size_t backendIndex = 0; backendIndex < backendCount; ++backendIndex) {
         const auto backend = Backends[backendIndex];
         // A backend can expose both a dedicated wrapper and the native FFmpeg
@@ -3066,11 +3106,13 @@ FFFResult PlayerSession::OpenHardwareVideoDecoder(AVFormatContext* owner, const 
                         continue;
                     }
                 }
+                ++hardwareCandidates;
                 AVCodecContext* candidate = nullptr;
                 std::int32_t hardwareFormat = AV_PIX_FMT_NONE;
                 std::string candidateFailure;
                 if (OpenDecoder(owner, index, true, &candidate, backend, &hardwareFormat,
                     true, codec, &candidateFailure) != FFFResult::Success) {
+                    ++decoderOpenFailures;
                     if (!candidateFailure.empty()) lastFailure = std::move(candidateFailure);
                     continue;
                 }
@@ -3080,6 +3122,7 @@ FFFResult PlayerSession::OpenHardwareVideoDecoder(AVFormatContext* owner, const 
                 // first packets before it is accepted.
                 if (HardwareTrialDecodeEnabled() &&
                     !HardwareDecoderProducesFrame(owner, index, candidate, &candidateFailure)) {
+                    ++trialRefusals;
                     if (candidateFailure.empty())
                         candidateFailure = "The GPU decoder produced no frame from this stream.";
                     lastFailure = std::move(candidateFailure);
@@ -3091,8 +3134,35 @@ FFFResult PlayerSession::OpenHardwareVideoDecoder(AVFormatContext* owner, const 
             }
         }
     }
+    // Two answers are worth keeping. No hardware candidate at all means this codec has
+    // no hardware decoder here, and a trial refusal means the driver was asked and said
+    // no. Anything that involved a decoder failing to open is left out on purpose: it
+    // may have run out of concurrent decode sessions rather than capability.
+    const auto refusedByCapability = hardwareCandidates == 0 || trialRefusals > 0;
+    if (HardwareRouteMemoryEnabled() && refusedByCapability && decoderOpenFailures == 0) {
+        RememberUnsupportedHardwareRoute(owner->streams[index]);
+        if (HardwareCapabilityTrace())
+            std::fprintf(stderr, "[hwcap] memory stream=%d remembered (candidates=%zu trialRefused=%zu openFailed=%zu)\n",
+                index, hardwareCandidates, trialRefusals, decoderOpenFailures);
+    }
     if (failureReason != nullptr) *failureReason = std::move(lastFailure);
     return FFFResult::NotSupported;
+}
+
+bool PlayerSession::HardwareRouteKnownUnsupported(const AVStream* stream) const noexcept {
+    if (stream == nullptr || stream->codecpar == nullptr) return false;
+    const auto key = HardwareRouteKey(stream->codecpar);
+    for (const auto remembered : unsupportedHardwareRoutes_)
+        if (remembered == key) return true;
+    return false;
+}
+
+void PlayerSession::RememberUnsupportedHardwareRoute(const AVStream* stream) noexcept {
+    if (stream == nullptr || stream->codecpar == nullptr) return;
+    const auto key = HardwareRouteKey(stream->codecpar);
+    for (const auto remembered : unsupportedHardwareRoutes_)
+        if (remembered == key) return;
+    try { unsupportedHardwareRoutes_.push_back(key); } catch (...) {}
 }
 
 bool PlayerSession::HardwareDecoderProducesFrame(AVFormatContext* owner, const std::int32_t index,
@@ -3260,12 +3330,23 @@ void PlayerSession::DoOpen(std::string path) noexcept {
         // A tiled still is assembled on the CPU, so a hardware decoder would only
         // add a device per tile and a download per tile: ask for the CPU decoder
         // outright and say so in the snapshot, which reports the route actually used.
-        auto result = tileGrid_
+        // A stream the GPU already refused in this session is not asked again: the
+        // attempt costs a decoder open plus a reopened demux for the trial packets,
+        // and the answer cannot have changed.
+        const auto tryHardware = decodeMode_ == FFF3FPDecodeMode::D3D11 &&
+            !HardwareRouteKnownUnsupported(format_->streams[videoStream_]);
+        auto result = tileGrid_ || !tryHardware
             ? OpenDecoder(format_, videoStream_, true, &videoDecoder_, -1, nullptr, false)
-            : (decodeMode_ == FFF3FPDecodeMode::D3D11
-                ? OpenHardwareVideoDecoder(format_, videoStream_, &videoDecoder_, &hardwareFailureReason)
-                : OpenDecoder(format_, videoStream_, true, &videoDecoder_));
+            : OpenHardwareVideoDecoder(format_, videoStream_, &videoDecoder_, &hardwareFailureReason);
         if (result == FFFResult::Success && tileGrid_) snapshot_.decodeMode = FFF3FPDecodeMode::Cpu;
+        if (result == FFFResult::Success && !tileGrid_ && !tryHardware &&
+            decodeMode_ == FFF3FPDecodeMode::D3D11) {
+            // Took the CPU route from memory. Report the route actually used, and say
+            // why, so a host that surfaces the fallback can explain it.
+            snapshot_.decodeMode = FFF3FPDecodeMode::Cpu;
+            hardwareFallback = true;
+            hardwareFailureReason = "The GPU decoder was rejected for this stream earlier in this session; playback is using CPU decoding.";
+        }
         if (result != FFFResult::Success && decodeMode_ == FFF3FPDecodeMode::D3D11 && !tileGrid_) {
             // OpenDecoder's default consults decodeMode_, so the retry has to ask for
             // the software decoder explicitly or it fails the same way.
@@ -6032,14 +6113,18 @@ void PlayerSession::DoSelectStream(const std::int32_t index, const bool video) n
         (video && (format_->streams[index]->disposition & AV_DISPOSITION_ATTACHED_PIC) != 0)) { ReportError(FFFResult::InvalidArgument, "The requested media stream is invalid.", "select-stream"); return; }
     AVCodecContext* replacement = nullptr;
     const auto previousDecodeMode = snapshot_.decodeMode;
-    auto result = video && decodeMode_ == FFF3FPDecodeMode::D3D11
+    // Same memory as the open path: a track whose hardware route was already refused
+    // is opened on the CPU directly instead of asking the GPU again.
+    const auto tryHardware = video && decodeMode_ == FFF3FPDecodeMode::D3D11 &&
+        !HardwareRouteKnownUnsupported(format_->streams[index]);
+    auto result = tryHardware
         ? OpenHardwareVideoDecoder(format_, index, &replacement)
-        : OpenDecoder(format_, index, video, &replacement);
+        : OpenDecoder(format_, index, video, &replacement, -1, nullptr, false);
     if (result != FFFResult::Success && video && decodeMode_ == FFF3FPDecodeMode::D3D11) {
         result = OpenDecoder(format_, index, true, &replacement, -1, nullptr, false);
         if (result == FFFResult::Success) snapshot_.decodeMode = FFF3FPDecodeMode::Cpu;
     } else if (result == FFFResult::Success && video) {
-        snapshot_.decodeMode = decodeMode_;
+        snapshot_.decodeMode = tryHardware ? decodeMode_ : FFF3FPDecodeMode::Cpu;
     }
     if (result != FFFResult::Success) { ReportError(result, "Could not open the selected media stream.", "select-stream"); return; }
     if (video) {

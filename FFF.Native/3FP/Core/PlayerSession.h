@@ -254,6 +254,20 @@ private:
     // being wrong in the "unsupported" direction silently disables a path that works.
     bool HardwareDecoderProducesFrame(AVFormatContext* format, std::int32_t streamIndex,
         AVCodecContext* decoder, std::string* failureReason = nullptr) noexcept;
+    // Asking the GPU once per stream is cheap but not free: it costs a decoder open
+    // plus a reopened demux for the trial packets. A stream the GPU has already
+    // refused is refused again on every retry, every track switch and every device
+    // rebuild, so the answer is remembered for the life of the session and the
+    // hardware attempt is skipped the next time.
+    //
+    // Only a refusal that says something about the *stream* is remembered -- no
+    // hardware pixel format for this codec, or the trial decode being rejected. A
+    // failure that says something about the *machine* is not: a decoder that could
+    // not be opened may simply have run out of concurrent decode sessions, which is
+    // exactly what a multi-view player does, and remembering that would disable a
+    // route that works as soon as another view closes.
+    bool HardwareRouteKnownUnsupported(const AVStream* stream) const noexcept;
+    void RememberUnsupportedHardwareRoute(const AVStream* stream) noexcept;
     FFFResult FallbackToSoftwareVideoDecoder(const char* reason) noexcept;
     // Maximum workers the shared thread budget allows: the CPU count minus the player's
     // own threads (worker, audio renderer, present thread) minus one core of scheduler
@@ -692,6 +706,10 @@ private:
     std::uint32_t sessionWrapFailures_;
     bool hardwareFallbackPending_;
     std::string pendingHardwareFallbackReason_;
+    // Streams whose hardware route has already been refused this session, keyed by
+    // codec + profile + pixel format + frame size. A handful of entries at most, so a
+    // linear scan beats a hash table here.
+    std::vector<std::uint64_t> unsupportedHardwareRoutes_;
     bool internalAudioFailurePending_;
     FFFResult internalAudioFailureResult_;
     std::uint32_t internalAudioDecodeErrorCount_;
