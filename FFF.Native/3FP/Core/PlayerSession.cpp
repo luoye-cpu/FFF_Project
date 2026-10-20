@@ -385,41 +385,21 @@ AVPixelFormat SelectHardwareFormat(AVCodecContext* context, const AVPixelFormat*
     return AV_PIX_FMT_NONE;
 }
 
-// The hardware capability probe is on by default. Setting FFF3FP_HWCAP_PROBE=0
-// restores the pre-probe ordering exactly, which is what an A/B measurement needs.
+// The predictive D3D11 capability probe is OFF by default. It asks the driver
+// whether a decoder configuration exists, which is exact for what it asks, but it
+// is a prediction about one backend only and the authoritative answer is the trial
+// decode (see HardwareDecoderProducesFrame). Keep it behind a flag for A/B work.
 bool HardwareCapabilityProbeEnabled() noexcept {
     wchar_t value[8]{};
-    if (GetEnvironmentVariableW(L"FFF3FP_HWCAP_PROBE", value, 8) == 0) return true;
-    return !(value[0] == L'0' && value[1] == L'\0');
+    if (GetEnvironmentVariableW(L"FFF3FP_HWCAP_PROBE", value, 8) == 0) return false;
+    return value[0] == L'1' && value[1] == L'\0';
 }
 
-// A hardware frame pool cannot carry 4:2:2 or 4:4:4 samples: both the d3d11va and
-// the CUDA pool allocate NV12 / P010 / P016 surfaces. That is a property of the
-// hwaccel, not of this machine, so refusing those streams is exact and costs
-// nothing. It has to happen before the backend loop: the loop tries CUDA after
-// D3D11VA, and a CUDA decoder that opens happily still rejects the first real
-// packet, which costs a DoSeek + ClearVideoQueue + RebuildMediaInfo round trip
-// (measured -15%..-30% fps on a 4:4:4 source).
-bool IsHardwareFramePoolFormat(const AVPixelFormat format) noexcept {
-    switch (format) {
-    // Not resolved yet: missing information is not a verdict.
-    case AV_PIX_FMT_NONE:
-    case AV_PIX_FMT_YUV420P: case AV_PIX_FMT_YUVJ420P:
-    case AV_PIX_FMT_NV12: case AV_PIX_FMT_NV21:
-    case AV_PIX_FMT_YUV420P9LE: case AV_PIX_FMT_YUV420P10LE: case AV_PIX_FMT_P010:
-    case AV_PIX_FMT_YUV420P12LE: case AV_PIX_FMT_YUV420P14LE:
-    case AV_PIX_FMT_YUV420P16LE: case AV_PIX_FMT_P016:
-        return true;
-    default: return false;
-    }
-}
-
-// The pool gate is on by default. FFF3FP_HWCAP_POOLGATE=0 restores the previous
-// "try every backend and fall back on the first packet" behaviour, which is what
-// an A/B measurement of the gate needs.
-bool HardwareFramePoolGateEnabled() noexcept {
+// The trial decode is the gate, so it is on by default. FFF3FP_HWCAP_TRIAL=0
+// restores "open the decoder and hope", which is what an A/B measurement needs.
+bool HardwareTrialDecodeEnabled() noexcept {
     wchar_t value[8]{};
-    if (GetEnvironmentVariableW(L"FFF3FP_HWCAP_POOLGATE", value, 8) == 0) return true;
+    if (GetEnvironmentVariableW(L"FFF3FP_HWCAP_TRIAL", value, 8) == 0) return true;
     return !(value[0] == L'0' && value[1] == L'\0');
 }
 
@@ -3010,16 +2990,23 @@ FFFResult PlayerSession::OpenHardwareVideoDecoder(AVFormatContext* owner, const 
     AVCodecContext** output, std::string* failureReason) noexcept {
     if (owner == nullptr || index < 0 || index >= static_cast<std::int32_t>(owner->nb_streams))
         return FFFResult::InvalidArgument;
-    // Refuse streams whose samples no hardware frame pool can hold before touching
-    // any backend (see IsHardwareFramePoolFormat).
-    if (!HardwareFramePoolGateEnabled()) {
-        // Gate disabled for A/B work: keep the pre-gate behaviour exactly.
-    } else if (!IsHardwareFramePoolFormat(
-            static_cast<AVPixelFormat>(owner->streams[index]->codecpar->format))) {
-        if (failureReason != nullptr)
-            *failureReason = "No hardware frame pool can hold this pixel format; it decodes on the CPU.";
-        return FFFResult::NotSupported;
-    }
+    // There is exactly one gate and it is a measurement, not a prediction: each
+    // backend's decoder is opened and then asked to produce a frame from the
+    // stream's own first packets (HardwareDecoderProducesFrame).
+    //
+    // Nothing here decides by pixel format, codec, resolution or device. Every such
+    // rule has to be maintained per hwaccel and per GPU generation, and a rule that
+    // is wrong in the "unsupported" direction silently disables a path that works:
+    // NVDEC decodes HEVC 4:4:4 from Turing onwards, H.264 4:4:4 on Turing and again
+    // from Blackwell, and HEVC 4:2:2 from Blackwell, while DXVA has no 4:2:2 or
+    // 4:4:4 decoder surface at all. The same stream is therefore supported and
+    // unsupported depending on the backend, and only asking tells them apart.
+    //
+    // Doing it here -- inside the open, before the presentation queue, the media
+    // info and the seek path exist -- is what makes it cheap. The same failure
+    // discovered later during playback costs DoSeek + ClearVideoQueue +
+    // RebuildMediaInfo; discovered here it costs one avio seek back to where the
+    // reader already was.
     const AVHWDeviceType Backends[] = {
         // Prefer the renderer's own D3D11 device: decoded surfaces can then be
         // sampled directly without a GPU-to-CPU-to-GPU round trip. CUDA remains
@@ -3087,10 +3074,18 @@ FFFResult PlayerSession::OpenHardwareVideoDecoder(AVFormatContext* owner, const 
                     if (!candidateFailure.empty()) lastFailure = std::move(candidateFailure);
                     continue;
                 }
-                // Do not pre-decode media here. The first real packet validates
-                // the selected hardware format through SelectHardwareFormat;
-                // DecodePacket already falls back to software decoding when the
-                // driver rejects it.
+                // The gate. This backend has just proved it can open a decoder for
+                // this codec, which says nothing about whether it can decode this
+                // stream, so it now has to produce a frame from the stream's own
+                // first packets before it is accepted.
+                if (HardwareTrialDecodeEnabled() &&
+                    !HardwareDecoderProducesFrame(owner, index, candidate, &candidateFailure)) {
+                    if (candidateFailure.empty())
+                        candidateFailure = "The GPU decoder produced no frame from this stream.";
+                    lastFailure = std::move(candidateFailure);
+                    avcodec_free_context(&candidate);
+                    continue;
+                }
                 *output = candidate;
                 return FFFResult::Success;
             }
@@ -3098,6 +3093,69 @@ FFFResult PlayerSession::OpenHardwareVideoDecoder(AVFormatContext* owner, const 
     }
     if (failureReason != nullptr) *failureReason = std::move(lastFailure);
     return FFFResult::NotSupported;
+}
+
+bool PlayerSession::HardwareDecoderProducesFrame(AVFormatContext* owner, const std::int32_t index,
+    AVCodecContext* decoder, std::string* failureReason) noexcept {
+    if (owner == nullptr || decoder == nullptr) return false;
+    AVPacket* packet = av_packet_alloc();
+    AVFrame* frame = av_frame_alloc();
+    auto finish = [&](const bool accept, std::string detail) noexcept {
+        av_frame_free(&frame);
+        av_packet_free(&packet);
+        // Leave the decoder empty: whatever it buffered during the trial is not part
+        // of playback, which starts from the beginning of the stream.
+        avcodec_flush_buffers(decoder);
+        if (!accept && failureReason != nullptr)
+            *failureReason = detail.empty()
+                ? "The GPU decoder produced no frame from this stream; playback continued with CPU decoding."
+                : "The GPU decoder rejected this stream (" + detail + "); playback continued with CPU decoding.";
+        if (HardwareCapabilityTrace())
+            std::fprintf(stderr, "[hwcap] trial stream=%d accept=%d err=%s\n",
+                index, accept ? 1 : 0, detail.c_str());
+        return accept;
+    };
+    if (packet == nullptr || frame == nullptr) return finish(true, "out of memory");
+    // Read the trial packets from a context of our own. Rewinding the caller's
+    // context instead -- avio_seek back plus avformat_flush -- restores the byte
+    // position but not the demuxer's own read state, and measured worse than not
+    // checking at all: a 3 s HEVC stream decoded 0 of 90 frames and playback ended
+    // immediately. Playback's context is therefore never touched here.
+    //
+    // A trial that cannot be run accepts the decoder: missing information is not a
+    // verdict, and the pre-existing fallback in DecodePacket still covers a decoder
+    // that fails later.
+    if (owner->url == nullptr || owner->url[0] == '\0') return finish(true, "no url");
+    AVFormatContext* probe = nullptr;
+    if (avformat_open_input(&probe, owner->url, nullptr, nullptr) < 0 || probe == nullptr)
+        return finish(true, "reopen failed");
+    const auto streamCountMatches = probe->nb_streams == owner->nb_streams;
+    bool produced = false;
+    std::string detail;
+    if (streamCountMatches) {
+        // Enough packets to cover a decoder with output delay plus a reopened GOP;
+        // stop as soon as a frame arrives, which for nearly every stream is the first
+        // packet of the stream.
+        for (int attempt = 0; attempt < 32 && !produced; ++attempt) {
+            if (av_read_frame(probe, packet) < 0) break;
+            if (packet->stream_index != index) { av_packet_unref(packet); continue; }
+            const auto sendResult = avcodec_send_packet(decoder, packet);
+            av_packet_unref(packet);
+            if (sendResult < 0) { detail = FfmpegError(sendResult); break; }
+            const auto receiveResult = avcodec_receive_frame(decoder, frame);
+            if (receiveResult == 0) produced = true;
+            else if (receiveResult != AVERROR(EAGAIN) && receiveResult != AVERROR_EOF) {
+                detail = FfmpegError(receiveResult);
+                break;
+            }
+        }
+        // A decoder with output delay answers EAGAIN until it is drained, and draining
+        // is safe here: the decoder is flushed on the way out either way.
+        if (!produced && detail.empty() && avcodec_send_packet(decoder, nullptr) == 0 &&
+            avcodec_receive_frame(decoder, frame) == 0) produced = true;
+    } else detail = "stream count differs";
+    avformat_close_input(&probe);
+    return finish(produced || !streamCountMatches, detail);
 }
 
 void PlayerSession::DoOpen(std::string path) noexcept {

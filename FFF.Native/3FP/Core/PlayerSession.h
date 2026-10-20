@@ -3,6 +3,7 @@
 #include "3FP/Api/FFF.Player.Api.h"
 #include "3FP/Api/FFF.Player.AudioRenderPlug.h"
 #include "3FP/Audio/WasapiRenderer.h"
+#include "3FP/Core/AvifTileGridComposer.h"
 #include "3FP/Core/PlacementPolicy.h"
 // IAMF needs the AOM reference decoder: FFmpeg splits an IAMF element into
 // dependent substreams and never mixes them (see IamfAudioDecoder.h).
@@ -246,6 +247,13 @@ private:
         const AVCodec* codecOverride = nullptr, std::string* failureReason = nullptr) noexcept;
     FFFResult OpenHardwareVideoDecoder(AVFormatContext* format, std::int32_t streamIndex,
         AVCodecContext** decoder, std::string* failureReason = nullptr) noexcept;
+    // The one hardware gate: feed the stream's first packets through a decoder that
+    // has just been opened and see whether a frame comes out. Asking the GPU is the
+    // only question that is exact for every backend and every device -- a format or
+    // capability table has to be maintained per hwaccel and per GPU generation, and
+    // being wrong in the "unsupported" direction silently disables a path that works.
+    bool HardwareDecoderProducesFrame(AVFormatContext* format, std::int32_t streamIndex,
+        AVCodecContext* decoder, std::string* failureReason = nullptr) noexcept;
     FFFResult FallbackToSoftwareVideoDecoder(const char* reason) noexcept;
     // Maximum workers the shared thread budget allows: the CPU count minus the player's
     // own threads (worker, audio renderer, present thread) minus one core of scheduler
@@ -266,6 +274,15 @@ private:
     // picture and for an animated one, both of which must show a frame without
     // playback running; rewinds afterwards so play starts from the beginning.
     FFFResult DecodeInitialFrame() noexcept;
+    // A tiled still image (grid AVIF/HEIC) has no pre-assembled picture anywhere in
+    // the file: it is one stream per tile plus a grid group saying where the tiles
+    // go. This decodes them and presents the canvas they make, and it can run again
+    // after a device change because the tile packets were read at open.
+    FFFResult ComposeTileGridFrame() noexcept;
+    // Reads each tile's packets once, in draw order's stream set, so the canvas can
+    // be rebuilt without a demuxer rewind (a still image has no timeline to seek to).
+    void ReadTileGridPackets() noexcept;
+    void ResetTileGrid() noexcept;
     /// Applies a display matrix found on the newest decoded frame. Needed because
     /// still images expose EXIF orientation only as frame side data.
     void ApplyRotationFromDecodedFrame() noexcept;
@@ -650,6 +667,14 @@ private:
     bool externalAudioDrained_;
     bool audioClockFinished_;
     bool staticImage_;
+    // A tiled still image: several tile streams that only become the picture once
+    // they are placed on the grid's canvas. Set at open from the tile grid group.
+    bool tileGrid_;
+    std::int32_t tileGridWidth_;
+    std::int32_t tileGridHeight_;
+    std::uint8_t tileGridBackground_[4];
+    std::vector<AvifTileGridComposer::Tile> tileGridTiles_;
+    std::vector<AvifTileGridComposer::TileSource> tileGridSources_;
     // A picture that moves: either a loop-aware image demuxer (GIF/APNG/WebP) or
     // an image sequence carried by the mov demuxer (AVIF/HEIC). Such a file is
     // not a still image, but it is still a picture: it must show its first frame
