@@ -1,4 +1,5 @@
 #include "pch.h"
+#include "3FP/Core/AvifIlocShim.h"
 #include "3FP/Core/MediaText.h"
 #include "3FP/Core/PlayerSession.h"
 
@@ -384,6 +385,48 @@ AVPixelFormat SelectHardwareFormat(AVCodecContext* context, const AVPixelFormat*
     return AV_PIX_FMT_NONE;
 }
 
+// The hardware capability probe is on by default. Setting FFF3FP_HWCAP_PROBE=0
+// restores the pre-probe ordering exactly, which is what an A/B measurement needs.
+bool HardwareCapabilityProbeEnabled() noexcept {
+    wchar_t value[8]{};
+    if (GetEnvironmentVariableW(L"FFF3FP_HWCAP_PROBE", value, 8) == 0) return true;
+    return !(value[0] == L'0' && value[1] == L'\0');
+}
+
+// A hardware frame pool cannot carry 4:2:2 or 4:4:4 samples: both the d3d11va and
+// the CUDA pool allocate NV12 / P010 / P016 surfaces. That is a property of the
+// hwaccel, not of this machine, so refusing those streams is exact and costs
+// nothing. It has to happen before the backend loop: the loop tries CUDA after
+// D3D11VA, and a CUDA decoder that opens happily still rejects the first real
+// packet, which costs a DoSeek + ClearVideoQueue + RebuildMediaInfo round trip
+// (measured -15%..-30% fps on a 4:4:4 source).
+bool IsHardwareFramePoolFormat(const AVPixelFormat format) noexcept {
+    switch (format) {
+    // Not resolved yet: missing information is not a verdict.
+    case AV_PIX_FMT_NONE:
+    case AV_PIX_FMT_YUV420P: case AV_PIX_FMT_YUVJ420P:
+    case AV_PIX_FMT_NV12: case AV_PIX_FMT_NV21:
+    case AV_PIX_FMT_YUV420P9LE: case AV_PIX_FMT_YUV420P10LE: case AV_PIX_FMT_P010:
+    case AV_PIX_FMT_YUV420P12LE: case AV_PIX_FMT_YUV420P14LE:
+    case AV_PIX_FMT_YUV420P16LE: case AV_PIX_FMT_P016:
+        return true;
+    default: return false;
+    }
+}
+
+// The pool gate is on by default. FFF3FP_HWCAP_POOLGATE=0 restores the previous
+// "try every backend and fall back on the first packet" behaviour, which is what
+// an A/B measurement of the gate needs.
+bool HardwareFramePoolGateEnabled() noexcept {
+    wchar_t value[8]{};
+    if (GetEnvironmentVariableW(L"FFF3FP_HWCAP_POOLGATE", value, 8) == 0) return true;
+    return !(value[0] == L'0' && value[1] == L'\0');
+}
+
+bool HardwareCapabilityTrace() noexcept {
+    return GetEnvironmentVariableW(L"FFF3FP_HWCAP_TRACE", nullptr, 0) != 0;
+}
+
 AVPixelFormat FindHardwareFormat(const AVCodec* codec, const AVHWDeviceType deviceType) noexcept {
     if (codec == nullptr) return AV_PIX_FMT_NONE;
     const auto expectedFormat = deviceType == AV_HWDEVICE_TYPE_D3D11VA
@@ -478,6 +521,32 @@ bool IsStillImage(const AVFormatContext* format, const std::int32_t streamIndex)
 
 // A still image must fit a single D3D11 texture (maximum side: 16384).
 constexpr std::int32_t MaxStillImageDimension = 16384;
+
+// Only a still-image container can carry a layered item, and only those files are
+// read whole on the way to the demuxer: everything else keeps its file-backed
+// input. 256 MiB is far above any still image that reaches here.
+constexpr std::int64_t MaxRepairedStillImageBytes = 256 * 1024 * 1024;
+
+// Cheap gate in front of AvifIlocShim, so no other media pays for the read.
+bool IsStillImageContainerName(const std::string& path) noexcept {
+    // Compared against the extension without its dot.
+    static const std::string_view kNames[] = {"avif", "avifs", "heic", "heif", "heics", "heifs"};
+    const auto dot = path.find_last_of('.');
+    if (dot == std::string::npos || dot + 1 >= path.size()) return false;
+    const std::string_view extension(path.data() + dot + 1, path.size() - dot - 1);
+    for (const auto name : kNames) {
+        if (extension.size() != name.size()) continue;
+        bool match = true;
+        for (std::size_t index = 0; index < name.size(); ++index) {
+            const auto character = extension[index];
+            const auto lower = character >= 'A' && character <= 'Z'
+                ? static_cast<char>(character - 'A' + 'a') : character;
+            if (lower != name[index]) { match = false; break; }
+        }
+        if (match) return true;
+    }
+    return false;
+}
 
 std::int64_t EstimateDuration100ns(const AVFormatContext* format) noexcept {
     if (format == nullptr) return 0;
@@ -714,6 +783,7 @@ PlayerSession::PlayerSession(const FFF3FPConfiguration& configuration)
       draining_(false), demuxEnded_(false), audioDecoderDrained_(false),
       externalAudioDrained_(false), audioClockFinished_(false),
       staticImage_(false), animatedImage_(false), sessionWrapLoop_(false), sessionWrapFailures_(0),
+      tileGrid_(false), tileGridWidth_(0), tileGridHeight_(0), tileGridBackground_{},
       hardwareFallbackPending_(false), internalAudioFailurePending_(false),
       internalAudioFailureResult_(FFFResult::Success), internalAudioDecodeErrorCount_(0) {
     snapshot_ = {};
@@ -2592,7 +2662,18 @@ FFFResult PlayerSession::OpenFormat(const std::string& path, AVFormatContext** o
     AVDictionary* options = nullptr;
     av_dict_set(&options, "protocol_whitelist", "file,crypto,data", 0);
     av_dict_set(&options, "protocol_blacklist", "http,https,tcp,tls,udp,rtp,rtsp,srt,rist,ftp,ssh", 0);
-    io = SharedFileInput::Open(path.c_str(), error);
+    // A layered ("progressive") AVIF stores its primary item as several extents,
+    // and the mov demuxer refuses those before any decoder runs. Repairing the box
+    // means editing the bytes, so such a file is read and repaired here and handed
+    // to the demuxer from memory; every other media keeps its file-backed input.
+    // The gate is a container name check so nothing else pays for the read.
+    std::vector<std::uint8_t> repairedBytes;
+    std::string repairDetail;
+    const bool repaired = IsStillImageContainerName(path) &&
+        AvifIlocShim::ReadAndRepair(path.c_str(), MaxRepairedStillImageBytes,
+            repairedBytes, repairDetail);
+    io = repaired ? SharedFileInput::OpenMemory(repairedBytes.data(), repairedBytes.size(), error)
+                  : SharedFileInput::Open(path.c_str(), error);
     if (io == nullptr) {
         av_dict_free(&options);
         return FFFResult::NativeFailure;
@@ -2929,6 +3010,16 @@ FFFResult PlayerSession::OpenHardwareVideoDecoder(AVFormatContext* owner, const 
     AVCodecContext** output, std::string* failureReason) noexcept {
     if (owner == nullptr || index < 0 || index >= static_cast<std::int32_t>(owner->nb_streams))
         return FFFResult::InvalidArgument;
+    // Refuse streams whose samples no hardware frame pool can hold before touching
+    // any backend (see IsHardwareFramePoolFormat).
+    if (!HardwareFramePoolGateEnabled()) {
+        // Gate disabled for A/B work: keep the pre-gate behaviour exactly.
+    } else if (!IsHardwareFramePoolFormat(
+            static_cast<AVPixelFormat>(owner->streams[index]->codecpar->format))) {
+        if (failureReason != nullptr)
+            *failureReason = "No hardware frame pool can hold this pixel format; it decodes on the CPU.";
+        return FFFResult::NotSupported;
+    }
     const AVHWDeviceType Backends[] = {
         // Prefer the renderer's own D3D11 device: decoded surfaces can then be
         // sampled directly without a GPU-to-CPU-to-GPU round trip. CUDA remains
@@ -2963,6 +3054,31 @@ FFFResult PlayerSession::OpenHardwareVideoDecoder(AVFormatContext* owner, const 
                 if (codec->id != parameters->codec_id || !av_codec_is_decoder(codec) ||
                     (IsDedicatedCudaDecoder(codec) ? 0 : 1) != dedicatedPass ||
                     FindHardwareFormat(codec, backend) == AV_PIX_FMT_NONE) continue;
+                // 2026-10-21: ask the driver before building the decoder. The old path
+                // trusted the pixel format the codec merely *declares* and only learned
+                // that the driver disagrees on the first real packet, which costs a
+                // DoSeek + ClearVideoQueue + RebuildMediaInfo round trip (measured
+                // -15%..-30% fps on a 4:4:4 source). The question asked here is purely
+                // "does a decoder configuration exist" -- never "is it fast enough",
+                // because throughput has no standard API and single-stream decoding is
+                // assumed to fit.
+                if (backend == AV_HWDEVICE_TYPE_D3D11VA && HardwareCapabilityProbeEnabled()) {
+                    const auto* probe = owner->streams[index]->codecpar;
+                    const auto support = videoRenderer_.QueryD3D11DecodeSupport(
+                        static_cast<std::int32_t>(probe->codec_id), probe->profile,
+                        static_cast<std::int32_t>(probe->format), probe->width, probe->height);
+                    if (HardwareCapabilityTrace())
+                        std::fprintf(stderr, "[hwcap] codec=%d %dx%d fmt=%d -> %s\n",
+                            static_cast<int>(probe->codec_id), probe->width, probe->height,
+                            static_cast<int>(probe->format),
+                            support == PlayerVideoRenderer::D3D11DecodeSupport::Supported ? "supported"
+                                : support == PlayerVideoRenderer::D3D11DecodeSupport::Unsupported
+                                    ? "unsupported" : "unknown");
+                    if (support == PlayerVideoRenderer::D3D11DecodeSupport::Unsupported) {
+                        lastFailure = "The D3D11 driver exposes no decoder configuration for this stream.";
+                        continue;
+                    }
+                }
                 AVCodecContext* candidate = nullptr;
                 std::int32_t hardwareFormat = AV_PIX_FMT_NONE;
                 std::string candidateFailure;
@@ -3021,6 +3137,17 @@ void PlayerSession::DoOpen(std::string path) noexcept {
     // Select session rewind only after stream classification is available.
     sessionWrapLoop_ = IsAnimatedImageSequence(format_);
     staticImage_ = IsStillImage(format_, videoStream_);
+    // A tiled still image is one stream per tile, so the stream picked above is only
+    // the first tile. Recognize such a file from its tile grid group and read every
+    // tile's packets now, while the demuxer is still at the start of the file: the
+    // canvas is assembled from them, and a still image has no timeline to rewind.
+    ResetTileGrid();
+    if (staticImage_ &&
+        AvifTileGridComposer::Describe(format_, tileGridWidth_, tileGridHeight_,
+            tileGridTiles_, tileGridBackground_)) {
+        tileGrid_ = true;
+        ReadTileGridPackets();
+    }
     // Rotation is a *view* property, so it is applied through the same renderer
     // path the image mode and the host's manual R key use. Decoding stays
     // untouched: the frame keeps its native orientation and only the sampling
@@ -3034,13 +3161,18 @@ void PlayerSession::DoOpen(std::string path) noexcept {
     // Reject it here with the real limit instead. Video is not checked here and
     // keeps its existing behaviour.
     if (staticImage_) {
-        const auto* imageParameters = format_->streams[videoStream_]->codecpar;
-        if (imageParameters->width > MaxStillImageDimension ||
-            imageParameters->height > MaxStillImageDimension) {
+        // A tiled still is checked against the canvas it assembles into, not against
+        // the single tile the stream points at.
+        const auto imageWidth = tileGrid_ ? tileGridWidth_
+            : format_->streams[videoStream_]->codecpar->width;
+        const auto imageHeight = tileGrid_ ? tileGridHeight_
+            : format_->streams[videoStream_]->codecpar->height;
+        if (imageWidth > MaxStillImageDimension ||
+            imageHeight > MaxStillImageDimension) {
             Fail(FFFResult::NotSupported,
                 "The still image is too large to display: " +
-                std::to_string(imageParameters->width) + "x" +
-                std::to_string(imageParameters->height) +
+                std::to_string(imageWidth) + "x" +
+                std::to_string(imageHeight) +
                 " exceeds the limit of " + std::to_string(MaxStillImageDimension) +
                 " pixels per side.", "open-image-size");
             return;
@@ -3058,10 +3190,16 @@ void PlayerSession::DoOpen(std::string path) noexcept {
         // GPU refuses. Formats with no hardware path (PNG, WebP, TIFF, JPEG XL, JXR) are
         // refused inside the hardware open before any device is created, so probing them
         // costs nothing.
-        auto result = decodeMode_ == FFF3FPDecodeMode::D3D11
-            ? OpenHardwareVideoDecoder(format_, videoStream_, &videoDecoder_, &hardwareFailureReason)
-            : OpenDecoder(format_, videoStream_, true, &videoDecoder_);
-        if (result != FFFResult::Success && decodeMode_ == FFF3FPDecodeMode::D3D11) {
+        // A tiled still is assembled on the CPU, so a hardware decoder would only
+        // add a device per tile and a download per tile: ask for the CPU decoder
+        // outright and say so in the snapshot, which reports the route actually used.
+        auto result = tileGrid_
+            ? OpenDecoder(format_, videoStream_, true, &videoDecoder_, -1, nullptr, false)
+            : (decodeMode_ == FFF3FPDecodeMode::D3D11
+                ? OpenHardwareVideoDecoder(format_, videoStream_, &videoDecoder_, &hardwareFailureReason)
+                : OpenDecoder(format_, videoStream_, true, &videoDecoder_));
+        if (result == FFFResult::Success && tileGrid_) snapshot_.decodeMode = FFF3FPDecodeMode::Cpu;
+        if (result != FFFResult::Success && decodeMode_ == FFF3FPDecodeMode::D3D11 && !tileGrid_) {
             // OpenDecoder's default consults decodeMode_, so the retry has to ask for
             // the software decoder explicitly or it fails the same way.
             result = OpenDecoder(format_, videoStream_, true, &videoDecoder_, -1, nullptr, false);
@@ -3120,7 +3258,13 @@ void PlayerSession::DoOpen(std::string path) noexcept {
         snapshot_.position100ns = 0; snapshot_.frameIndex = -1; snapshot_.framePts = AV_NOPTS_VALUE;
         snapshot_.selectedVideoStream = videoStream_; snapshot_.selectedAudioStream = audioStream_;
         snapshot_.videoWidth = snapshot_.videoHeight = 0; snapshot_.isHdrSource = 0;
-        if (videoStream_ >= 0) { snapshot_.videoWidth = videoDecoder_->width; snapshot_.videoHeight = videoDecoder_->height; ApplyHdrState(snapshot_, videoRenderer_.HdrState()); }
+        // A tiled still image is presented as its canvas, so that is what the host
+        // has to see: the decoder belongs to one tile and would report a fraction.
+        if (videoStream_ >= 0) {
+            snapshot_.videoWidth = tileGrid_ ? tileGridWidth_ : videoDecoder_->width;
+            snapshot_.videoHeight = tileGrid_ ? tileGridHeight_ : videoDecoder_->height;
+            ApplyHdrState(snapshot_, videoRenderer_.HdrState());
+        }
         else if (coverArtFrame_ != nullptr) { snapshot_.videoWidth = coverArtFrame_->width; snapshot_.videoHeight = coverArtFrame_->height; snapshot_.isHdrSource = 0; }
         // Downgrade only if HDR/wide-gamut output is unachievable; EnsureSwapChain
         // rechecks this gate before selecting the actual format. The scRGB
@@ -3210,10 +3354,70 @@ void PlayerSession::DoOpen(std::string path) noexcept {
     }
 }
 
+void PlayerSession::ResetTileGrid() noexcept {
+    tileGrid_ = false;
+    tileGridWidth_ = 0;
+    tileGridHeight_ = 0;
+    for (auto& byte : tileGridBackground_) byte = 0;
+    tileGridTiles_.clear();
+    AvifTileGridComposer::ReleaseSources(tileGridSources_);
+}
+
+void PlayerSession::ReadTileGridPackets() noexcept {
+    if (format_ == nullptr || !tileGrid_) return;
+    // One bucket per tile stream. The whole file is walked once: a grid still is a
+    // handful of packets and there is no timeline to come back for them later.
+    tileGridSources_.clear();
+    for (const auto& tile : tileGridTiles_) {
+        auto& source = tileGridSources_.emplace_back();
+        source.streamIndex = tile.streamIndex;
+    }
+    auto* packet = av_packet_alloc();
+    if (packet == nullptr) { ResetTileGrid(); return; }
+    while (av_read_frame(format_, packet) >= 0) {
+        for (auto& source : tileGridSources_) {
+            if (source.streamIndex != packet->stream_index) continue;
+            auto* copy = av_packet_alloc();
+            if (copy == nullptr || av_packet_ref(copy, packet) < 0) {
+                av_packet_free(&copy);
+                av_packet_unref(packet);
+                av_packet_free(&packet);
+                ResetTileGrid();
+                return;
+            }
+            source.packets.push_back(copy);
+            break;
+        }
+        av_packet_unref(packet);
+    }
+    av_packet_free(&packet);
+    for (const auto& source : tileGridSources_) {
+        if (source.packets.empty()) { ResetTileGrid(); return; }
+    }
+}
+
+FFFResult PlayerSession::ComposeTileGridFrame() noexcept {
+    if (format_ == nullptr) return FFFResult::InvalidState;
+    auto* canvas = AvifTileGridComposer::Compose(format_, tileGridTiles_, tileGridSources_,
+        tileGridWidth_, tileGridHeight_, tileGridBackground_);
+    if (canvas == nullptr) return FFFResult::FfmpegFailure;
+    const auto before = videoRenderer_.PresentedVideoFrames();
+    NormalizeVideoFrameTimestamp(canvas);
+    PresentVideoFrame(canvas, format_);
+    av_frame_free(&canvas);
+    // The canvas is the only frame this picture has, so a presentation that did not
+    // happen is a failed open rather than a silently empty one.
+    if (videoRenderer_.PresentedVideoFrames() == before) return FFFResult::FfmpegFailure;
+    return FFFResult::Success;
+}
+
 FFFResult PlayerSession::DecodeInitialFrame() noexcept {
     if (format_ == nullptr || videoDecoder_ == nullptr || videoStream_ < 0)
         return FFFResult::InvalidState;
     if (!staticImage_ && !animatedImage_) return FFFResult::InvalidState;
+    // A tiled still image has nothing to read: its packets were taken at open and
+    // the picture is the canvas assembled from them.
+    if (tileGrid_) return ComposeTileGridFrame();
     if (playbackPacket_ == nullptr) playbackPacket_ = av_packet_alloc();
     if (playbackPacket_ == nullptr) return FFFResult::NativeFailure;
     if (stillImagePacket_ == nullptr) stillImagePacket_ = av_packet_alloc();
@@ -5867,6 +6071,8 @@ void PlayerSession::DoClose(const FFF3FPState finalState, const bool preserveVid
     if (playbackPacket_) av_packet_free(&playbackPacket_);
     if (stillImagePacket_) av_packet_free(&stillImagePacket_);
     if (externalAudioPacket_) av_packet_free(&externalAudioPacket_);
+    // The tile packets belong to the format being closed, so they go with it.
+    ResetTileGrid();
     ClearVideoQueue();
     for (auto*& frame : videoFramePool_) av_frame_free(&frame);
     videoFramePool_.clear();
@@ -6045,6 +6251,10 @@ void PlayerSession::RebuildMediaInfo() noexcept {
         << ",\"fileSize\":" << std::max<std::int64_t>(0, format_->pb ? avio_size(format_->pb) : 0)
         << ",\"probeScore\":" << format_->probe_score
         << ",\"staticImage\":" << (staticImage_ ? "true" : "false")
+        << ",\"tileGrid\":" << (tileGrid_ ? "true" : "false")
+        << ",\"tileGridWidth\":" << tileGridWidth_
+        << ",\"tileGridHeight\":" << tileGridHeight_
+        << ",\"tileGridTileCount\":" << tileGridTiles_.size()
         << ",\"metadata\":";
     AppendDictionaryJson(json, format_->metadata);
     json << ",\"chapters\":[";
