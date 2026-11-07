@@ -53,19 +53,40 @@
 FLAC.lib; opus.lib` + **59** 个 `absl_*.lib`（磁盘 59 个逐名相符）。这些 `.lib` 均为 `!<arch>` 静态归档、
 体内 0 个 `.dll` 名引用；PDB 内 `FLAC__` 180 / `IAMF` 183 / `opus_multistream` 7 命中。
 
-| 组件 | 许可（按上游，**仓内无原文** ⇒ 未判定具体版本） |
+| 组件 | 许可（按上游；原文收集状态 2026-11-07 更新，文件在本仓 `licenses\`） |
 |---|---|
-| libiamf | BSD-3-Clause（IIS Clearing House）；仓内唯一文本是 `third_party\libiamf\LICENSE.libiamf.txt` |
-| OAR / OBR | 随 libiamf 一族分发，许可文本同上；**未判定** |
-| FLAC | BSD-3-Clause（Xiph）；**未判定**（无原文） |
-| opus | BSD-3-Clause（Xiph）；**未判定**（无原文） |
-| pffft | **未判定** |
-| abseil-cpp（59 件） | Apache-2.0；**未判定**（无原文） |
+| libiamf | BSD-3-Clause Clear（Alliance for Open Media，2022）；原文已收：`licenses\libiamf-LICENSE.txt`（上游 main）+ `licenses\libiamf-PATENTS.txt`（同仓专利声明）；构建副本为 `third_party\libiamf\LICENSE.libiamf.txt`（钉定版本 `b276f437`） |
+| OAR | BSD-3-Clause Clear（AOM，2022）；原文已收：`licenses\oar-LICENSE.txt`（自 libiamf 钉定版本的 oar 子模块 `ca14b543` 收取，与上游 main 现行文本存在版本差异，main 版留档 `licenses\oar-LICENSE-main-branch.txt`） |
+| OBR | 随 oar 仓分发（`oar\src\renderer\obr\obr_capi\obr`，README 自述 Open Binaural Renderer）；**上游无独立 LICENSE 文件**，按宿主仓 oar 的 BSD-3-Clause Clear 对待；具体授权含义**未判定** |
+| FLAC | BSD-3-Clause（Xiph）；**未判定**（无原文；libiamf 的 `dep_codecs\` 只给 bin/include/lib 预编译件，无许可文本） |
+| opus | BSD-3-Clause（Xiph）；**未判定**（无原文，同上） |
+| pffft | FFTPACK/UCAR 条款（Julien Pommier 2013 原作 + Hayati Ayguen 2020 修改）；原文头部已收：`licenses\pffft-license-header.txt`（hayguen/pffft master；libiamf 树内无 pffft 源码与许可件，bazel 经 `external\pffft.BUILD` 拉取） |
+| abseil-cpp（59 件） | Apache-2.0；原文已收：`licenses\abseil-cpp-LICENSE` |
 
-**`fdk-aac.lib` 已于 2026-10-15 从本树摘除**：摘除前实测 `dumpbin /symbols iamf.lib` 的 `EXTERNREF`
-里 `aac` **0 命中**、整档 `aacDecoder_DecodeFrame`/`FRANZHOFER`/`fdk` 字符串 **0 命中**；摘除后
-`MSBUILD_NATIVE_RC=0`（链接通过 ⇒ 无未定义引用是实测）、导出表 **107 个名字集合与摘除前完全相同**。
-该行原本是上游自带（`d3f0945` 即命中），摘除会体现在本树相对上游的 diff 里。
+**`fdk-aac.lib` 链接行状态（2026-11-07 复核，推翻下文旧陈述）**：旧句"已于 2026-10-15 从本树摘除、
+摘除前 `iamf.lib` 无 FDK 引用"经实测**不成立**，本树（KF）三处实况互相一致——`FFF.Native.vcxproj:122`
+链 `fdk-aac.lib`、`tools\准备Libiamf.ps1:151` staging 它、磁盘 `lib\x64\fdk-aac.lib` 在（2026-11-06
+0:21，4,170,630 B）。证据链：
+
+- git 史（`git log -S fdk-aac`，三个触碰点）：`d3f0945`（2026-10-12 上游自带，链接行含 fdk-aac）→
+  `d19d198`（2026-10-15 从 vcxproj 摘除**但未动准备脚本**，同时写下本段的"已摘除"陈述）→
+  `b27c959`（2026-11-05 重新加回链接行，现行状态）。
+- 2026-11-07 `dumpbin /symbols` 实测（磁盘 iamf.lib 为 11-06 0:26 构建，SHA256 `F671CAF5…FF91`；
+  注意 `3fp\kernel\third_party` 是 junction，指向 `third_party\fff_project\third_party`，两树引用
+  同一物理件）：iamf.lib 共 **41 个归档成员**，其中 `aac_multistream_decoder.obj` 的 UNDEF External
+  符号含**全部 7 个 FDK API**（`aacDecoder_{Open,Close,Fill,SetParam,ConfigRaw,DecodeFrame,GetStreamInfo}`），
+  整档 aac/fdk 相关 UNDEF **12 个**；二进制串旁证 `aacDecoder_` 在 iamf.lib 7 命中、fdk-aac.lib 201 命中、
+  oar/obr/obr_capi/pffft/FLAC/opus 全 0（FDK 引用仅来自 iamf.lib）。fdk-aac.lib 恰好定义这 7 个符号
+  （各 1 个 Defined External）。当年"EXTERNREF 0 命中"的口径作废——dumpbin 输出中本无 EXTERNREF 字样，
+  实际要看的字段是 UNDEF External。
+- **机制**：静态库按需拉取。引用 FDK 的成员目前不在链接闭包内 ⇒ TP（链接行无 fdk-aac.lib，10-15 摘除后
+  `MSBUILD_NATIVE_RC=0`）与 KF（链接行有）都能链接通过；2026-11-07 复测 11-06 构建的成品
+  `FFF.Native.dll`（6,449,152 B）内 `aacDecoder_DecodeFrame` 串 **0 命中** ⇒ fdk-aac 代码**零进包**。
+- **处置（2026-11-07 裁决：保持链接不动）**：链接行与 staging 均不改——防御性保留，若未来内核改动使
+  `aac_multistream_decoder.obj` 进入抽取闭包，缺件会以 LNK2019 立即暴露而非静默出空。代价只是链接时
+  多读一个 4 MB 归档，零产物影响。
+- **许可**：fdk-aac 的许可原文**不在** libiamf 仓内（`code\dep_codecs\` 仅 bin/include/lib 预编译件），
+  **未判定**；因其代码零进包，不构成随包分发义务；若未来闭包变化使 FDK 代码进包，必须先收原文再发布。
 
 ## 4. LakeUI —— **GPL-3.0-only，且作者声明商用需取得许可**
 
@@ -93,6 +114,9 @@ FLAC.lib; opus.lib` + **59** 个 `absl_*.lib`（磁盘 59 个逐名相符）。�
 ## 7. 随包发布仍需处理（缺口，不是结论）
 
 1. §1 的 GPL 文本与"对应源码"要约（gpl+nonfree 构建）——未取得前不应对外分发。
-2. §3 的 libiamf / OAR / OBR / FLAC / opus / pffft / abseil 许可**原文**不在仓内 ⇒ `licenses\` 收不到它们。
+2. §3 的许可**原文**缺口（2026-11-07 更新）：已收 libiamf（LICENSE+PATENTS）、OAR、pffft（头部声明）、
+   abseil 四族入 `licenses\`（`tools\发布3FP.ps1` 的许可步骤需同步收集该目录）；仍缺 **FLAC / opus**
+   （Xiph 原文）、**OBR 单独文本**（上游无独立文件）、**fdk-aac**（libiamf 仓 `dep_codecs\` 只给预编译件；
+   其代码当前零进包，见 §3 处置）。
 3. §4 LakeUI 的许可取得状态待确认。
 4. 本文件与 §2 各 port 的 `copyright` 由 `tools\发布3FP.ps1` 的许可步骤随包；缺件默认中止。
