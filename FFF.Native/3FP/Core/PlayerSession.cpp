@@ -18,6 +18,7 @@
 #include "3FP/Core/MemoryBudgetMath.h"
 #include "3FP/Render/CicpSupport.h"
 #include "3FP/Api/FFF.Player.CpuPlacement.h"
+#include "3FP/Api/FFF.Player.DecodeAdapter.h"
 #include "3FP/Prefetch/PrefetchService.h"
 
 extern "C" {
@@ -4321,6 +4322,28 @@ FFFResult PlayerSession::GetCpuPlacementSnapshot(
     return FFFResult::Success;
 }
 
+FFFResult PlayerSession::GetDecodeAdapterInfo(FFF3FPDecodeAdapterInfo& info) const noexcept {
+    // Same shape as the CPU-placement snapshot: zero fill, then describe the caller's
+    // buffer. The export validates the incoming size/version before this runs.
+    std::memset(&info, 0, sizeof(info));
+    info.size = sizeof(FFF3FPDecodeAdapterInfo);
+    info.version = FFF3FP_DECODE_ADAPTER_VERSION;
+    // "Hardware in use" is the route the published snapshot reports, never the host's
+    // request: a GPU-mode session that fell back to the software decoder must answer
+    // hardware = 0 instead of naming a GPU it is not decoding on. The index itself is
+    // worker-owned and read through its atomic, so no session lock is taken.
+    FFF3FPDecodeMode published = FFF3FPDecodeMode::Cpu;
+    {
+        std::lock_guard lock(snapshotMutex_);
+        published = publishedSnapshot_.decodeMode;
+    }
+    if (published != FFF3FPDecodeMode::Cpu && published != FFF3FPDecodeMode::Unspecified) {
+        info.hardware = 1;
+        info.adapterIndex = decodeAdapterActive_.load(std::memory_order_acquire);
+    }
+    return FFFResult::Success;
+}
+
 std::uint64_t PlayerSession::PresentationCounter() const noexcept {
     return videoRenderer_.SwapChainPresents();
 }
@@ -5078,6 +5101,13 @@ FFFResult PlayerSession::OpenHardwareVideoDecoder(AVFormatContext* owner, const 
                         continue;
                     }
                     *output = candidate;
+                    // Record the adapter this decoder really opened on. A negative plan
+                    // entry means "use the playback device", so resolve the renderer's
+                    // own DXGI index here -- the device exists by the time a decoder
+                    // opens, and -1 still degrades to "unknown", never to a wrong card.
+                    decodeAdapterActive_.store(
+                        adapter >= 0 ? adapter : videoRenderer_.DeviceAdapterIndex(),
+                        std::memory_order_release);
                     return FFFResult::Success;
                 }
             }
@@ -5491,6 +5521,11 @@ void PlayerSession::DoOpen(std::string path, const bool networkInput,
     audioStream_ = FindDefaultOrFirstStream(format_, AVMEDIA_TYPE_AUDIO);
     if (videoStream_ < 0 && audioStream_ < 0) { Fail(FFFResult::NotSupported, "The file contains no playable video or audio stream.", "open"); return; }
     snapshot_.decodeMode = decodeMode_;
+    // Open() above only says what the host asked for; the decoder is opened further
+    // down. Drop the previous file's adapter now so the read-back window between the
+    // two cannot name a GPU this media was never decoded on. Every open path below
+    // (hardware or software) settles the value again before playback starts.
+    decodeAdapterActive_.store(-1, std::memory_order_release);
     // LibRaw develops on the CPU; there is no GPU decoder for a synthetic raw
     // stream. Report the route that actually runs so the snapshot does not
     // claim a D3D11 path that was never opened.

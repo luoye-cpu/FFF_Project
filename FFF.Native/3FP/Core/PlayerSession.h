@@ -47,6 +47,9 @@ struct AVFilterContext;
 // ABI struct appended to 3FP/Api/FFF.Player.CpuPlacement.h (P3-12). Forward-declared so
 // this header does not depend on the public diagnostic header; the .cpp includes it.
 struct FFF3FPCpuPlacementSnapshot;
+// Same arrangement for the appended decode-adapter read-back
+// (3FP/Api/FFF.Player.DecodeAdapter.h): forward-declared here, included by the .cpp.
+struct FFF3FPDecodeAdapterInfo;
 class Fmp4FragmentScanner;
 
 class PlayerSession final {
@@ -223,6 +226,11 @@ public:
     // Advisory read-only snapshot: it deliberately takes no session lock and changes no
     // behaviour, so a field may be one state transition old while it is being filled.
     FFFResult GetCpuPlacementSnapshot(FFF3FPCpuPlacementSnapshot& snapshot) const noexcept;
+    // Actual decode-adapter read-back (appended export FFF3FP_GetDecodeAdapterInfo).
+    // Reports the adapter a hardware video decoder really opened on, which is not
+    // necessarily the host's preferred index: the open path falls through the
+    // candidate plan. Read-only and lock-free (worker-owned atomics).
+    FFFResult GetDecodeAdapterInfo(FFF3FPDecodeAdapterInfo& info) const noexcept;
     // Live swap-chain flip count, read without copying the 608-byte snapshot.
     // Used by the still-image view timer to align submissions with flips.
     std::uint64_t PresentationCounter() const noexcept;
@@ -601,6 +609,10 @@ private:
     // what a hardware refusal falls back to, never what is asked for up front.
     FFF3FPDecodeMode decodeMode_;
     std::int32_t decodeAdapterIndex_ = -1;
+    // Adapter the accepted hardware decoder actually opened on (worker-owned; -1 =
+    // unknown / software route). Atomic because the API thread reads it while the
+    // worker re-opens decoders; a stale value is harmless, a torn one is not.
+    std::atomic<std::int32_t> decodeAdapterActive_{-1};
     PlaybackPerformancePolicy performance_;
     // See SetComparisonMode(). Plain bool: only ever touched on the host's
     // calling thread, never read from the render thread.

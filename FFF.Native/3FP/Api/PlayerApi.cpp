@@ -4,6 +4,7 @@
 #include "3FP/Api/FFF.Player.AudioRenderPlug.h"
 #include "3FP/Api/FFF.Player.AudioTap.h"
 #include "3FP/Api/FFF.Player.CpuPlacement.h"
+#include "3FP/Api/FFF.Player.DecodeAdapter.h"
 #include "3FP/Core/PlacementPolicy.h"
 #include "3FP/Core/PlayerSession.h"
 #include "3FP/Render/VideoRenderer.h"
@@ -718,4 +719,20 @@ FFFResult FFF3FP_GetCpuPlacementSnapshot(const FFF3FPHandle player,
         return FFFResult::InvalidArgument;
     }
     return static_cast<PlayerSession*>(player)->GetCpuPlacementSnapshot(*snapshot);
+}
+
+// Actual decode-adapter read-back (3FP/Api/FFF.Player.DecodeAdapter.h), appended additively
+// at the tail like the CPU-placement entry above: PlayerApiVersion/SnapshotVersion unchanged,
+// no snapshot field added, hosts resolve it by name and fall back to "unknown" when an older
+// kernel does not export it.
+FFFResult FFF3FP_GetDecodeAdapterInfo(const FFF3FPHandle player,
+    FFF3FPDecodeAdapterInfo* info) noexcept {
+    if (player == nullptr || info == nullptr) return FFFResult::InvalidArgument;
+    // Reject an ABI mismatch before the session overwrites the caller's struct with the
+    // version-1 layout (same guard the placement snapshot uses).
+    if (info->version != FFF3FP_DECODE_ADAPTER_VERSION ||
+        info->size < sizeof(FFF3FPDecodeAdapterInfo)) {
+        return FFFResult::InvalidArgument;
+    }
+    return static_cast<PlayerSession*>(player)->GetDecodeAdapterInfo(*info);
 }
